@@ -13,6 +13,9 @@
         <action
             android:id="@+id/action_home_to_camera"
             app:destination="@id/cameraFragment" />
+        <action
+            android:id="@+id/action_home_to_settings"
+            app:destination="@id/settingsFragment" />
     </fragment>
 
     <fragment
@@ -22,18 +25,20 @@
         tools:layout="@layout/fragment_camera">
         <action
             android:id="@+id/action_camera_to_result"
-            app:destination="@id/resultFragment" />
+            app:destination="@id/resultFragment"
+            app:popUpTo="@id/homeFragment"
+            app:popUpToInclusive="false"/>
     </fragment>
 
     <fragment
         android:id="@+id/resultFragment"
         android:name="com.example.grabit.ui.ResultFragment"
         android:label="ResultFragment"
-        tools:layout="@layout/fragment_result">
-        <action
-            android:id="@+id/action_result_to_home"
-            app:destination="@id/homeFragment"
-            app:popUpTo="@id/homeFragment"
-            app:popUpToInclusive="true"/>
-    </fragment>
+        tools:layout="@layout/fragment_result" />
+
+    <fragment
+        android:id="@+id/settingsFragment"
+        android:name="com.example.grabit.ui.SettingsFragment"
+        android:label="SettingsFragment"
+        tools:layout="@layout/fragment_settings" />
 </navigation>
