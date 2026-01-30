@@ -1,0 +1,366 @@
+package com.example.grabitTest
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.os.Bundle
+import android.util.Log
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.*
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import com.example.grabitTest.databinding.ActivityMainBinding
+import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.vision.core.RunningMode
+import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
+import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
+import org.tensorflow.lite.Interpreter
+import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.MappedByteBuffer
+import java.nio.channels.FileChannel
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import kotlin.math.max
+import kotlin.math.min
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var binding: ActivityMainBinding
+    private lateinit var cameraExecutor: ExecutorService
+
+    // AI 모델
+    private var yoloxInterpreter: Interpreter? = null
+    private var handLandmarker: HandLandmarker? = null
+
+    // FPS 측정
+    private var frameCount = 0
+    private var lastFpsTime = System.currentTimeMillis()
+
+    private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
+    private val REQUEST_CODE_PERMISSIONS = 10
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        binding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+
+        // 권한 확인
+        if (allPermissionsGranted()) {
+            startCamera()
+        } else {
+            ActivityCompat.requestPermissions(
+                this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
+            )
+        }
+
+        cameraExecutor = Executors.newSingleThreadExecutor()
+
+        // AI 모델 초기화
+        initYOLOX()
+        initMediaPipeHands()
+    }
+
+    private fun initYOLOX() {
+        try {
+            val modelFile = loadModelFile("yolox_int8.tflite")
+            val options = Interpreter.Options().apply {
+                setNumThreads(4)
+                // GPU 사용 시
+                // addDelegate(GpuDelegate())
+            }
+            yoloxInterpreter = Interpreter(modelFile, options)
+
+            Log.d(TAG, "✓ YOLOX 모델 로드 성공")
+            runOnUiThread {
+                binding.yoloxStatus.text = "📦 YOLOX: Ready (INT8)"
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "YOLOX 로드 실패", e)
+            runOnUiThread {
+                binding.yoloxStatus.text = "📦 YOLOX: Failed"
+            }
+        }
+    }
+
+    private fun initMediaPipeHands() {
+        try {
+            val baseOptions = BaseOptions.builder()
+                .setModelAssetPath("hand_landmarker.task")
+                .build()
+
+            val options = HandLandmarker.HandLandmarkerOptions.builder()
+                .setBaseOptions(baseOptions)
+                .setRunningMode(RunningMode.VIDEO)
+                .setNumHands(2)
+                .setMinHandDetectionConfidence(0.5f)
+                .setMinHandPresenceConfidence(0.5f)
+                .setMinTrackingConfidence(0.5f)
+                .build()
+
+            handLandmarker = HandLandmarker.createFromOptions(this, options)
+
+            Log.d(TAG, "✓ MediaPipe Hands 초기화 성공")
+            runOnUiThread {
+                binding.handsStatus.text = "🖐️ Hands: Ready"
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "MediaPipe Hands 초기화 실패", e)
+            runOnUiThread {
+                binding.handsStatus.text = "🖐️ Hands: Failed"
+            }
+        }
+    }
+
+    private fun loadModelFile(modelName: String): MappedByteBuffer {
+        val fileDescriptor = assets.openFd(modelName)
+        val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
+        val fileChannel = inputStream.channel
+        val startOffset = fileDescriptor.startOffset
+        val declaredLength = fileDescriptor.declaredLength
+        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+    }
+
+    private fun startCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+
+        cameraProviderFuture.addListener({
+            val cameraProvider = cameraProviderFuture.get()
+
+            // Preview
+            val preview = Preview.Builder()
+                .build()
+                .also {
+                    it.setSurfaceProvider(binding.previewView.surfaceProvider)
+                }
+
+            // ImageAnalysis
+            val imageAnalyzer = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+                .also {
+                    it.setAnalyzer(cameraExecutor, ImageAnalyzer())
+                }
+
+            // 카메라 선택
+            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+
+            try {
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(
+                    this, cameraSelector, preview, imageAnalyzer
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "카메라 바인딩 실패", e)
+            }
+
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    // 이미지 분석기
+    private inner class ImageAnalyzer : ImageAnalysis.Analyzer {
+
+        override fun analyze(imageProxy: ImageProxy) {
+            val startTime = System.currentTimeMillis()
+
+            // Bitmap 변환
+            val bitmap = imageProxy.toBitmap()
+            if (bitmap == null) {
+                imageProxy.close()
+                return
+            }
+
+            // 1. YOLOX 추론
+            val detections = runYOLOX(bitmap)
+
+            // 2. MediaPipe Hands 추론
+            val handsResult = runHands(bitmap, imageProxy.imageInfo.timestamp)
+
+            // 3. 결과 표시
+            val inferenceTime = System.currentTimeMillis() - startTime
+            displayResults(detections, handsResult, inferenceTime)
+
+            // FPS 계산
+            updateFPS()
+
+            imageProxy.close()
+        }
+
+        @androidx.camera.core.ExperimentalGetImage
+        private fun ImageProxy.toBitmap(): Bitmap? {
+            val image = this.image ?: return null
+            // YUV_420_888 → Bitmap 변환 (간단 버전)
+            // 실제로는 더 최적화된 변환 필요
+            return BitmapUtils.yuv420ToBitmap(image)
+        }
+    }
+
+    private fun runYOLOX(bitmap: Bitmap): List<OverlayView.DetectionBox> {
+        if (yoloxInterpreter == null) return emptyList()
+
+        try {
+            // 입력 크기 확인 (YOLOX-nano는 보통 416x416)
+            val inputShape = yoloxInterpreter!!.getInputTensor(0).shape()
+            val inputSize = inputShape[1] // [1, 416, 416, 3]
+
+            // 전처리
+            val resizedBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+            val inputBuffer = bitmapToByteBuffer(resizedBitmap, inputSize)
+
+            // 출력 버퍼 준비
+            val outputShape = yoloxInterpreter!!.getOutputTensor(0).shape()
+            val output = Array(1) { Array(outputShape[1]) { FloatArray(outputShape[2]) } }
+
+            // 추론
+            yoloxInterpreter!!.run(inputBuffer, output)
+
+            // 후처리 (NMS 등)
+            return parseYOLOXOutput(output[0], bitmap.width, bitmap.height, inputSize)
+
+        } catch (e: Exception) {
+            Log.e(TAG, "YOLOX 추론 실패", e)
+            return emptyList()
+        }
+    }
+
+    private fun bitmapToByteBuffer(bitmap: Bitmap, size: Int): ByteBuffer {
+        val buffer = ByteBuffer.allocateDirect(4 * size * size * 3)
+        buffer.order(ByteOrder.nativeOrder())
+
+        val pixels = IntArray(size * size)
+        bitmap.getPixels(pixels, 0, size, 0, 0, size, size)
+
+        for (pixelValue in pixels) {
+            // INT8 양자화 모델이므로 0-255 범위 유지
+            buffer.putFloat(((pixelValue shr 16) and 0xFF).toFloat())
+            buffer.putFloat(((pixelValue shr 8) and 0xFF).toFloat())
+            buffer.putFloat((pixelValue and 0xFF).toFloat())
+        }
+
+        return buffer
+    }
+
+    private fun parseYOLOXOutput(
+        output: Array<FloatArray>,
+        imageWidth: Int,
+        imageHeight: Int,
+        inputSize: Int
+    ): List<OverlayView.DetectionBox> {
+        val detections = mutableListOf<OverlayView.DetectionBox>()
+        val confidenceThreshold = 0.5f
+
+        // YOLOX 출력 파싱 (형식에 따라 다름)
+        // 일반적으로: [num_boxes, 85] (x, y, w, h, objectness, class_scores...)
+        for (i in output.indices) {
+            val box = output[i]
+            val confidence = box[4] // objectness
+
+            if (confidence > confidenceThreshold) {
+                val cx = box[0] / inputSize * imageWidth
+                val cy = box[1] / inputSize * imageHeight
+                val w = box[2] / inputSize * imageWidth
+                val h = box[3] / inputSize * imageHeight
+
+                val left = max(0f, cx - w / 2)
+                val top = max(0f, cy - h / 2)
+                val right = min(imageWidth.toFloat(), cx + w / 2)
+                val bottom = min(imageHeight.toFloat(), cy + h / 2)
+
+                // 클래스 찾기
+                val classScores = box.sliceArray(5 until box.size)
+                val classId = classScores.indices.maxByOrNull { classScores[it] } ?: 0
+                val classConfidence = classScores[classId] * confidence
+
+                detections.add(
+                    OverlayView.DetectionBox(
+                        label = "Object_$classId",
+                        confidence = classConfidence,
+                        rect = android.graphics.RectF(left, top, right, bottom)
+                    )
+                )
+            }
+        }
+
+        return detections
+    }
+
+    private fun runHands(bitmap: Bitmap, timestamp: Long): HandLandmarkerResult? {
+        if (handLandmarker == null) return null
+
+        try {
+            val mpImage = BitmapImageBuilder(bitmap).build()
+            return handLandmarker!!.detectForVideo(mpImage, timestamp / 1_000_000) // ns → ms
+        } catch (e: Exception) {
+            Log.e(TAG, "Hands 추론 실패", e)
+            return null
+        }
+    }
+
+    private fun displayResults(
+        detections: List<OverlayView.DetectionBox>,
+        handsResult: HandLandmarkerResult?,
+        inferenceTime: Long
+    ) {
+        runOnUiThread {
+            // 오버레이 업데이트
+            binding.overlayView.setDetections(detections)
+            binding.overlayView.setHands(handsResult)
+
+            // 상태 텍스트 업데이트
+            binding.yoloxStatus.text = "📦 YOLOX: ${detections.size} objects"
+
+            val handsCount = handsResult?.landmarks()?.size ?: 0
+            binding.handsStatus.text = "🖐️ Hands: $handsCount detected"
+
+            binding.inferenceTime.text = "⏱️ Inference: ${inferenceTime}ms"
+        }
+    }
+
+    private fun updateFPS() {
+        frameCount++
+        val currentTime = System.currentTimeMillis()
+        if (currentTime - lastFpsTime >= 1000) {
+            val fps = frameCount * 1000 / (currentTime - lastFpsTime)
+            runOnUiThread {
+                binding.fpsText.text = "FPS: $fps"
+            }
+            frameCount = 0
+            lastFpsTime = currentTime
+        }
+    }
+
+    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
+        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_CODE_PERMISSIONS) {
+            if (allPermissionsGranted()) {
+                startCamera()
+            } else {
+                Toast.makeText(this, "카메라 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
+                finish()
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        cameraExecutor.shutdown()
+        yoloxInterpreter?.close()
+        handLandmarker?.close()
+    }
+
+    companion object {
+        private const val TAG = "GrabIT_Test"
+    }
+}
