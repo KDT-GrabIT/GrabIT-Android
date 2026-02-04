@@ -71,7 +71,7 @@ class MainActivity : AppCompatActivity() {
     private fun initYOLOX() {
         try {
             // [파일명 확인] assets 폴더에 이 파일이 꼭 있어야 합니다.
-            val modelFilename = "yolox_fp16.tflite"
+            val modelFilename = "yolox_nano_640_gpu_fp16.tflite"
             val modelFile = loadModelFile(modelFilename)
 
             val options = Interpreter.Options()
