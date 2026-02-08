@@ -46,6 +46,8 @@ class GyroTrackingManager(
     private var currentSmoothedRect = RectF()
 
     var isLocked = false
+    /** occlusion 시 optical flow 사용 → true면 onBoxUpdate 호출 안 함 */
+    var suspendUpdates = false
     private var timestamp: Long = 0
     private var outOfBoundsCount = 0
     private var smoothedRollDegrees = 0f
@@ -96,6 +98,20 @@ class GyroTrackingManager(
     fun stopTracking() {
         isLocked = false
         sensorManager.unregisterListener(this)
+    }
+
+    /** YOLOX 검증 시 시각적 위치로 보정 (드리프트 제거) */
+    fun correctPosition(rect: RectF) {
+        initialRect.set(rect)
+        currentSmoothedRect.set(rect)
+        velocityX = 0f
+        velocityY = 0f
+        distanceX = 0f
+        distanceY = 0f
+        lastTimestampAccel = 0L
+        timestamp = 0L
+        smoothedRollDegrees = 0f
+        outOfBoundsCount = 0
     }
 
     fun resetToSearchingFromUI() {
@@ -213,7 +229,9 @@ class GyroTrackingManager(
         val isOutOfBounds = currentSmoothedRect.right < -margin || currentSmoothedRect.left > screenWidth + margin ||
             currentSmoothedRect.bottom < -margin || currentSmoothedRect.top > screenHeight + margin
 
-        val update = BoxUpdate(currentSmoothedRect, smoothedRollDegrees)
+        // 카메라 이미지는 폰 기울임에 따라 이미 한 번 기울어지므로, 박스는 반대 방향으로 회전해 보정
+        val update = BoxUpdate(currentSmoothedRect, -smoothedRollDegrees)
+        if (suspendUpdates) return  // occlusion: optical flow가 박스 위치 담당
         if (isOutOfBounds) {
             outOfBoundsCount++
             if (outOfBoundsCount >= OUT_OF_BOUNDS_FRAMES_TO_LOSE) {
