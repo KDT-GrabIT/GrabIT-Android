@@ -71,7 +71,14 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var gyroManager: GyroTrackingManager
 
-    private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
+    // STT / TTS
+    private var sttManager: STTManager? = null
+    private var ttsManager: TTSManager? = null
+
+    private val REQUIRED_PERMISSIONS = arrayOf(
+        Manifest.permission.CAMERA,
+        Manifest.permission.RECORD_AUDIO
+    )
     private val REQUEST_CODE_PERMISSIONS = 10
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -85,9 +92,11 @@ class MainActivity : AppCompatActivity() {
         initYOLOX()
         setupTargetSpinner()
         initGyroTrackingManager()
+        initSttTts()
 
         binding.startSearchBtn.setOnClickListener { onStartSearchClicked() }
         binding.resetBtn.setOnClickListener { gyroManager.resetToSearchingFromUI() }
+        binding.micButton.setOnClickListener { onMicButtonClicked() }
 
         if (allPermissionsGranted()) {
             binding.startSearchBtn.visibility = View.VISIBLE
@@ -104,6 +113,63 @@ class MainActivity : AppCompatActivity() {
         binding.previewView.visibility = View.VISIBLE
         binding.overlayView.visibility = View.VISIBLE
         startCamera()
+    }
+
+    private fun initSttTts() {
+        sttManager = STTManager(
+            context = this,
+            onResult = { text ->
+                runOnUiThread {
+                    Log.d(TAG, "[STT 결과] $text")
+                    binding.sttResultText.text = "🎤 $text"
+                    ttsManager?.speak(text)
+                }
+            },
+            onError = { msg ->
+                runOnUiThread {
+                    Log.e(TAG, "[STT 에러] $msg")
+                    binding.sttResultText.text = "❌ $msg"
+                    Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+                }
+            },
+            onListeningChanged = { listening ->
+                runOnUiThread {
+                    binding.micButton.isEnabled = !listening
+                    binding.sttResultText.text = if (listening) "🎤 듣는 중..." else binding.sttResultText.text
+                }
+            }
+        ).also { if (it.init()) Log.d(TAG, "STT 초기화 완료") }
+
+        ttsManager = TTSManager(
+            context = this,
+            onReady = { Log.d(TAG, "TTS 준비 완료") },
+            onSpeakDone = { Log.d(TAG, "TTS 재생 완료") },
+            onError = { msg ->
+                runOnUiThread {
+                    Log.e(TAG, "[TTS 에러] $msg")
+                    Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+                }
+            }
+        )
+        ttsManager?.init { success ->
+            runOnUiThread {
+                if (success) Log.d(TAG, "TTS 초기화 완료") else Log.e(TAG, "TTS 초기화 실패")
+            }
+        }
+    }
+
+    private fun onMicButtonClicked() {
+        if (!allPermissionsGranted()) {
+            Toast.makeText(this, "마이크 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
+            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
+            return
+        }
+        if (sttManager?.isListening() == true) {
+            sttManager?.stopListening()
+        } else {
+            binding.sttResultText.text = "🎤 듣는 중..."
+            sttManager?.startListening()
+        }
     }
 
     private fun initGyroTrackingManager() {
@@ -755,6 +821,8 @@ class MainActivity : AppCompatActivity() {
         yoloxInterpreter?.close()
         gpuDelegate?.close()
         gyroManager.stopTracking()
+        sttManager?.release()
+        ttsManager?.release()
     }
 
     companion object {
