@@ -16,6 +16,12 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import android.graphics.RectF
 import com.example.grabitTest.databinding.ActivityMainBinding
+import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.vision.core.RunningMode
+import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
+import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
+import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.GpuDelegate
 import java.io.BufferedReader
@@ -40,6 +46,10 @@ class MainActivity : AppCompatActivity() {
     // AI 모델
     private var yoloxInterpreter: Interpreter? = null
     private var gpuDelegate: GpuDelegate? = null
+    private var handLandmarker: HandLandmarker? = null
+
+    // LIVE_STREAM: Hands 결과는 콜백으로 옴 → 최신 값만 보관
+    private val latestHandsResult = AtomicReference<HandLandmarkerResult?>(null)
 
     // FPS 측정
     private var frameCount = 0
@@ -65,11 +75,20 @@ class MainActivity : AppCompatActivity() {
     private var pendingLockBox: OverlayView.DetectionBox? = null
     private var pendingLockCount = 0
 
+    /** LOCKED 시 YOLOX 검증+보정: N프레임마다 1회 실행 (자이로 + 시각 보정) */
+    private val VALIDATION_INTERVAL = 4
+    private val VALIDATION_FAIL_LIMIT = 3
+    private var validationFailCount = 0
+    private var lockedFrameCount = 0
+
+    private lateinit var gyroManager: GyroTrackingManager
+    private val opticalFlowTracker = OpticalFlowTracker()
+
+    private var wasOccluded = false  // occlusion → non-occlusion 전환 시 gyro 동기화용
+
     private val TARGET_CONFIDENCE_THRESHOLD = 0.6f  // 60% 이상 확신 시에만 고정 (잘못된 클래스 방지)
     private val TARGET_ANY = "모든 상품"
     private val currentTargetLabel = AtomicReference<String>("")
-
-    private lateinit var gyroManager: GyroTrackingManager
 
     // STT / TTS
     private var sttManager: STTManager? = null
@@ -90,6 +109,7 @@ class MainActivity : AppCompatActivity() {
 
         loadClassLabels()
         initYOLOX()
+        initMediaPipeHands()
         setupTargetSpinner()
         initGyroTrackingManager()
         initSttTts()
@@ -192,6 +212,34 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    private fun initMediaPipeHands() {
+        try {
+            val baseOptions = BaseOptions.builder()
+                .setModelAssetPath("hand_landmarker.task")
+                .build()
+
+            val options = HandLandmarker.HandLandmarkerOptions.builder()
+                .setBaseOptions(baseOptions)
+                .setRunningMode(RunningMode.LIVE_STREAM)
+                .setNumHands(2)
+                .setMinHandDetectionConfidence(0.5f)
+                .setMinHandPresenceConfidence(0.5f)
+                .setMinTrackingConfidence(0.5f)
+                .setResultListener { result, image ->
+                    latestHandsResult.set(result)
+                }
+                .setErrorListener { e ->
+                    Log.e(TAG, "Hands LIVE_STREAM error", e)
+                }
+                .build()
+
+            handLandmarker = HandLandmarker.createFromOptions(this, options)
+            Log.d(TAG, "✓ MediaPipe Hands 초기화 성공")
+        } catch (e: Exception) {
+            Log.e(TAG, "MediaPipe Hands 초기화 실패", e)
+        }
+    }
+
     private fun setupTargetSpinner() {
         val spinnerItems = listOf(TARGET_ANY) + classLabels
         binding.targetSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, spinnerItems)
@@ -205,6 +253,37 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun getTargetLabel(): String = currentTargetLabel.get()
+
+    /** LOCKED 시 시각 보정: 이전 박스와 IoU가 가장 큰 타겟 detection 반환. 없으면 null
+     * @param minConfidence occlusion 시 더 낮은 기준 사용 (예: 0.15f) */
+    private fun findTrackedTarget(
+        detections: List<OverlayView.DetectionBox>,
+        targetLabel: String,
+        prevBox: OverlayView.DetectionBox?,
+        minConfidence: Float = TARGET_CONFIDENCE_THRESHOLD * 0.5f
+    ): OverlayView.DetectionBox? {
+        val target = targetLabel.trim()
+        if (target.isBlank()) return null
+
+        val candidates = detections.filter { d ->
+            (d.label.trim().equals(target, ignoreCase = true) ||
+                d.topLabels.any { it.first.trim().equals(target, ignoreCase = true) }) &&
+            d.confidence >= minConfidence
+        }.map { d ->
+            if (d.label.trim().equals(target, ignoreCase = true)) d
+            else {
+                val conf = d.topLabels.find { it.first.trim().equals(target, ignoreCase = true) }?.second?.div(100f) ?: d.confidence
+                d.copy(label = target, confidence = conf, topLabels = listOf(target to (conf * 100).toInt()))
+            }
+        }
+
+        if (candidates.isEmpty()) return null
+        return if (prevBox != null) {
+            candidates.maxByOrNull { iou(it.rect, prevBox.rect) }
+        } else {
+            candidates.maxByOrNull { it.confidence }
+        }
+    }
 
     /** 타겟에 맞는 detection만 반환. "모든 상품"이면 전부, 특정 상품이면 해당 상품만. */
     private fun filterDetectionsByTarget(detections: List<OverlayView.DetectionBox>, targetLabel: String): List<OverlayView.DetectionBox> {
@@ -260,6 +339,7 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread {
             searchState = SearchState.LOCKED
             lockedTargetLabel = box.label
+            validationFailCount = 0
             frozenImageWidth = imageWidth
             frozenImageHeight = imageHeight
             binding.resetBtn.visibility = View.VISIBLE
@@ -277,6 +357,10 @@ class MainActivity : AppCompatActivity() {
             lockedTargetLabel = ""
             pendingLockBox = null
             pendingLockCount = 0
+            validationFailCount = 0
+            wasOccluded = false
+            opticalFlowTracker.reset()
+            gyroManager.stopTracking()
             binding.resetBtn.visibility = View.GONE
             binding.overlayView.setDetections(emptyList(), 0, 0)
             binding.overlayView.setFrozen(false)
@@ -430,6 +514,9 @@ class MainActivity : AppCompatActivity() {
             val h = bitmap.height
             val inferenceTime = System.currentTimeMillis() - startTime
 
+            // MediaPipe Hands: LIVE_STREAM → 비동기 전달만 하고 즉시 return (블로킹 없음)
+            sendFrameToHands(bitmap, imageProxy.imageInfo.timestamp)
+
             when (searchState) {
                 SearchState.SEARCHING -> {
                     val detections = runYOLOX(bitmap)
@@ -447,7 +534,11 @@ class MainActivity : AppCompatActivity() {
                                 frozenBox = matched
                                 frozenImageWidth = w
                                 frozenImageHeight = h
+                                wasOccluded = false
+                                opticalFlowTracker.reset()
                                 gyroManager.startTracking(matched.rect, w, h)
+                                lockedFrameCount = 0
+                                validationFailCount = 0
                                 updateFPS()
                                 imageProxy.close()
                                 return
@@ -463,9 +554,58 @@ class MainActivity : AppCompatActivity() {
                     displayResults(filterDetectionsByTarget(detections, getTargetLabel()), inferenceTime, w, h)
                 }
                 SearchState.LOCKED -> {
+                    // YOLOX: N프레임마다 검증 + 시각 보정 (자이로 드리프트 보정)
+                    lockedFrameCount++
+                    val shouldValidate = (lockedFrameCount % VALIDATION_INTERVAL) == 0
+                    var inferMs = System.currentTimeMillis() - startTime
+
+                    val handsOverlap = frozenBox?.let { box ->
+                        isHandOverlappingBox(latestHandsResult.get(), box.rect, w, h)
+                    } ?: false
+
+                    gyroManager.suspendUpdates = handsOverlap
+
+                    if (handsOverlap) {
+                        // occlusion: optical flow로 화면 이동량 추적 → 박스도 동일 이동
+                        val handRect = mergedHandRect(latestHandsResult.get(), w, h)
+                        val flow = opticalFlowTracker.update(bitmap, handRect, frozenBox?.rect)
+                        flow?.let { (dx, dy) ->
+                            val box = frozenBox ?: return@let
+                            val r = box.rect
+                            val newRect = RectF(r.left + dx, r.top + dy, r.right + dx, r.bottom + dy)
+                            gyroManager.correctPosition(newRect)
+                            frozenBox = box.copy(rect = newRect)
+                        }
+                    } else {
+                        // occlusion 해제 → gyro 기저 동기화
+                        if (wasOccluded) {
+                            frozenBox?.rect?.let { gyroManager.correctPosition(it) }
+                        }
+                        if (shouldValidate) {
+                            val detections = runYOLOX(bitmap)
+                            inferMs = System.currentTimeMillis() - startTime
+                            val minConf = TARGET_CONFIDENCE_THRESHOLD * 0.5f
+                            val tracked = findTrackedTarget(detections, lockedTargetLabel, frozenBox, minConf)
+                            if (tracked != null) {
+                                validationFailCount = 0
+                                gyroManager.correctPosition(tracked.rect)
+                                frozenBox = tracked.copy(rotationDegrees = 0f)
+                                frozenImageWidth = w
+                                frozenImageHeight = h
+                            } else {
+                                validationFailCount++
+                                if (validationFailCount >= VALIDATION_FAIL_LIMIT) {
+                                    validationFailCount = 0
+                                    gyroManager.resetToSearchingFromUI()
+                                }
+                            }
+                        }
+                    }
+                    wasOccluded = handsOverlap
+
                     val box = frozenBox
                     val boxes = if (box != null) listOf(box) else emptyList()
-                    displayResults(boxes, inferenceTime, frozenImageWidth, frozenImageHeight)
+                    displayResults(boxes, inferMs, frozenImageWidth, frozenImageHeight)
                 }
             }
 
@@ -729,6 +869,52 @@ class MainActivity : AppCompatActivity() {
         return picked
     }
 
+    /** 손 랜드마크(정규화 0~1) → 이미지 좌표 RectF */
+    private fun handLandmarksToRect(landmarks: List<NormalizedLandmark>, imageWidth: Int, imageHeight: Int): RectF {
+        if (landmarks.isEmpty()) return RectF(0f, 0f, 0f, 0f)
+        val xs = landmarks.map { it.x().coerceIn(0f, 1f) * imageWidth }
+        val ys = landmarks.map { it.y().coerceIn(0f, 1f) * imageHeight }
+        return RectF(xs.min(), ys.min(), xs.max(), ys.max())
+    }
+
+    /** 손 랜드마크들 → 모든 손을 포함하는 단일 RectF (optical flow 마스킹용) */
+    private fun mergedHandRect(handsResult: HandLandmarkerResult?, imageWidth: Int, imageHeight: Int): RectF? {
+        val landmarks = handsResult?.landmarks() ?: return null
+        if (landmarks.isEmpty()) return null
+        var union: RectF? = null
+        for (hand in landmarks) {
+            val r = handLandmarksToRect(hand, imageWidth, imageHeight)
+            union = if (union == null) r else {
+                val u = RectF(union)
+                u.union(r)
+                u
+            }
+        }
+        return union
+    }
+
+    /** 손이 박스와 겹치면 true (occlusion) */
+    private fun isHandOverlappingBox(handsResult: HandLandmarkerResult?, boxRect: RectF, imageWidth: Int, imageHeight: Int): Boolean {
+        val landmarks = handsResult?.landmarks() ?: return false
+        if (imageWidth <= 0 || imageHeight <= 0) return false
+        return landmarks.any { hand ->
+            val handRect = handLandmarksToRect(hand, imageWidth, imageHeight)
+            iou(handRect, boxRect) > 0.1f
+        }
+    }
+
+    /** LIVE_STREAM: 프레임만 넘기고 즉시 return. 결과는 resultListener 콜백으로 옴. */
+    private fun sendFrameToHands(bitmap: Bitmap, timestampNs: Long) {
+        if (handLandmarker == null) return
+        try {
+            val mpImage = BitmapImageBuilder(bitmap).build()
+            val timestampMs = timestampNs / 1_000_000
+            handLandmarker!!.detectAsync(mpImage, timestampMs)
+        } catch (e: Exception) {
+            Log.e(TAG, "Hands detectAsync 실패", e)
+        }
+    }
+
     private fun iou(a: android.graphics.RectF, b: android.graphics.RectF): Float {
         val interLeft = max(a.left, b.left)
         val interTop = max(a.top, b.top)
@@ -750,6 +936,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         runOnUiThread {
             binding.overlayView.setDetections(detections, imageWidth, imageHeight)
+            binding.overlayView.setHands(latestHandsResult.get())
 
             when (searchState) {
                 SearchState.SEARCHING -> {
@@ -823,6 +1010,8 @@ class MainActivity : AppCompatActivity() {
         gyroManager.stopTracking()
         sttManager?.release()
         ttsManager?.release()
+        handLandmarker?.close()
+        if (::gyroManager.isInitialized) gyroManager.stopTracking()
     }
 
     companion object {

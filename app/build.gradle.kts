@@ -66,5 +66,8 @@ android {
         implementation("com.google.ai.edge.litert:litert-gpu:1.4.1")
         // Support 라이브러리도 LiteRT 버전으로 맞춤 (선택사항이나 충돌 방지 권장)
         implementation("com.google.ai.edge.litert:litert-support:1.4.1")
+
+        // 4. OpenCV (optical flow - occlusion 시 화면 이동량 추적)
+        implementation("org.opencv:opencv:4.9.0")
     }
 }
