@@ -5,6 +5,9 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.os.Bundle
 import android.util.Log
+import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
@@ -12,11 +15,6 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.example.grabitTest.databinding.ActivityMainBinding
-import com.google.mediapipe.framework.image.BitmapImageBuilder
-import com.google.mediapipe.tasks.core.BaseOptions
-import com.google.mediapipe.tasks.vision.core.RunningMode
-import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
-import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.GpuDelegate
 import java.io.BufferedReader
@@ -40,9 +38,7 @@ class MainActivity : AppCompatActivity() {
 
     // AI 모델
     private var yoloxInterpreter: Interpreter? = null
-    // [추가] GPU 델리게이트 변수
     private var gpuDelegate: GpuDelegate? = null
-    private var handLandmarker: HandLandmarker? = null
 
     // FPS 측정
     private var frameCount = 0
@@ -52,11 +48,22 @@ class MainActivity : AppCompatActivity() {
     private var yoloxShapeInfo: String? = null
     private var lastYoloxMaxConf = 0f
 
-    // LIVE_STREAM: Hands 결과는 콜백으로 옴 → 최신 값만 보관
-    private val latestHandsResult = AtomicReference<HandLandmarkerResult?>(null)
-
     /** 클래스 인덱스 → 이름 (assets/classes.txt, 한 줄에 하나, # 무시) */
     private var classLabels: List<String> = emptyList()
+
+    enum class SearchState { SEARCHING, LOCKED }
+    private var searchState = SearchState.SEARCHING
+    private var frozenBox: OverlayView.DetectionBox? = null
+    private var frozenImageWidth = 0
+    private var frozenImageHeight = 0
+    /** State B에서 계속 추적할 타겟 라벨 (락 시점의 box.label) */
+    private var lockedTargetLabel: String = ""
+
+    private val TARGET_CONFIDENCE_THRESHOLD = 0.6f  // 60% 이상 확신 시에만 고정 (잘못된 클래스 방지)
+    private val TARGET_ANY = "모든 상품"
+    private val currentTargetLabel = AtomicReference<String>("")
+
+    private lateinit var gyroManager: GyroTrackingManager
 
     private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
     private val REQUEST_CODE_PERMISSIONS = 10
@@ -66,20 +73,120 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        // 권한 확인
-        if (allPermissionsGranted()) {
-            startCamera()
-        } else {
-            ActivityCompat.requestPermissions(
-                this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
-            )
-        }
-
         cameraExecutor = Executors.newSingleThreadExecutor()
 
         loadClassLabels()
         initYOLOX()
-        initMediaPipeHands()
+        setupTargetSpinner()
+        initGyroTrackingManager()
+
+        binding.startSearchBtn.setOnClickListener { onStartSearchClicked() }
+        binding.resetBtn.setOnClickListener { gyroManager.resetToSearchingFromUI() }
+
+        if (allPermissionsGranted()) {
+            binding.startSearchBtn.visibility = View.VISIBLE
+        } else {
+            binding.startSearchBtn.visibility = View.GONE
+            ActivityCompat.requestPermissions(
+                this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
+            )
+        }
+    }
+
+    private fun onStartSearchClicked() {
+        binding.startSearchBtn.visibility = View.GONE
+        binding.previewView.visibility = View.VISIBLE
+        binding.overlayView.visibility = View.VISIBLE
+        startCamera()
+    }
+
+    private fun initGyroTrackingManager() {
+        gyroManager = GyroTrackingManager(
+            context = this,
+            runYOLOX = { runYOLOX(it) },
+            findTargetMatch = { detections, label -> findTargetMatch(detections, label) },
+            getTargetLabel = { getTargetLabel() },
+            onTransitionToLocked = { box, w, h -> transitionToLocked(box, w, h) },
+            onTransitionToSearching = { transitionToSearching() },
+            getCurrentBox = { frozenBox },
+            setCurrentBox = { box, w, h ->
+                frozenBox = box
+                frozenImageWidth = w
+                frozenImageHeight = h
+                if (searchState == SearchState.LOCKED && box != null) {
+                    binding.overlayView.setDetections(listOf(box), w, h)
+                }
+            }
+        )
+    }
+
+    private fun setupTargetSpinner() {
+        val spinnerItems = listOf(TARGET_ANY) + classLabels
+        binding.targetSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, spinnerItems)
+        currentTargetLabel.set(TARGET_ANY)
+        binding.targetSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(p0: AdapterView<*>?, p1: View?, pos: Int, p3: Long) {
+                currentTargetLabel.set(spinnerItems.getOrNull(pos) ?: "")
+            }
+            override fun onNothingSelected(p0: AdapterView<*>?) {}
+        }
+    }
+
+    private fun getTargetLabel(): String = currentTargetLabel.get()
+
+    /** 타겟이 primary label 또는 topLabels에 있고 confidence >= 70%인 detection 중 최고 확률 선택.
+     *  "모든 상품" 선택 시: confidence >= 70%인 detection 중 최고 확률 반환 */
+    private fun findTargetMatch(detections: List<OverlayView.DetectionBox>, targetLabel: String): OverlayView.DetectionBox? {
+        val target = targetLabel.trim()
+        if (target.isBlank()) return null
+
+        if (target == TARGET_ANY) {
+            return detections.filter { it.confidence >= TARGET_CONFIDENCE_THRESHOLD }.maxByOrNull { it.confidence }
+        }
+
+        return detections
+            .mapNotNull { box ->
+                val targetConf = when {
+                    box.label.trim().equals(target, ignoreCase = true) -> box.confidence
+                    else -> box.topLabels.find { it.first.trim().equals(target, ignoreCase = true) }?.second?.div(100f)
+                }
+                if (targetConf != null && targetConf >= TARGET_CONFIDENCE_THRESHOLD) {
+                    if (box.label.trim().equals(target, ignoreCase = true)) box
+                    else box.copy(
+                        label = target,
+                        confidence = targetConf,
+                        topLabels = listOf(target to (targetConf * 100).toInt())
+                    )
+                } else null
+            }
+            .maxByOrNull { it.confidence }
+    }
+
+    private fun transitionToLocked(box: OverlayView.DetectionBox, imageWidth: Int, imageHeight: Int) {
+        runOnUiThread {
+            searchState = SearchState.LOCKED
+            lockedTargetLabel = box.label
+            frozenImageWidth = imageWidth
+            frozenImageHeight = imageHeight
+            binding.resetBtn.visibility = View.VISIBLE
+            binding.overlayView.setDetections(listOf(box), imageWidth, imageHeight)
+            binding.overlayView.setFrozen(true)
+            binding.yoloxStatus.text = "🔒 고정: ${box.label} (자이로)"
+            binding.handsStatus.text = "📐 자이로: ON"
+            Toast.makeText(this, "타겟 고정 → 자이로 추적 모드", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun transitionToSearching() {
+        runOnUiThread {
+            searchState = SearchState.SEARCHING
+            lockedTargetLabel = ""
+            binding.resetBtn.visibility = View.GONE
+            binding.overlayView.setDetections(emptyList(), 0, 0)
+            binding.overlayView.setFrozen(false)
+            binding.yoloxStatus.text = "🔍 탐색 중..."
+            binding.handsStatus.text = "📐 자이로: OFF"
+        }
     }
 
     /** assets/classes.txt 로드 (한 줄 = 한 클래스, 0번째 줄 = class 0). # 시작 줄 무시. */
@@ -154,41 +261,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun initMediaPipeHands() {
-        try {
-            val baseOptions = BaseOptions.builder()
-                .setModelAssetPath("hand_landmarker.task")
-                .build()
-
-            val options = HandLandmarker.HandLandmarkerOptions.builder()
-                .setBaseOptions(baseOptions)
-                .setRunningMode(RunningMode.LIVE_STREAM)
-                .setNumHands(2)
-                .setMinHandDetectionConfidence(0.5f)
-                .setMinHandPresenceConfidence(0.5f)
-                .setMinTrackingConfidence(0.5f)
-                .setResultListener { result, image ->
-                    latestHandsResult.set(result)
-                }
-                .setErrorListener { e ->
-                    Log.e(TAG, "Hands LIVE_STREAM error", e)
-                }
-                .build()
-
-            handLandmarker = HandLandmarker.createFromOptions(this, options)
-
-            Log.d(TAG, "✓ MediaPipe Hands 초기화 성공")
-            runOnUiThread {
-                binding.handsStatus.text = "🖐️ Hands: Ready"
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "MediaPipe Hands 초기화 실패", e)
-            runOnUiThread {
-                binding.handsStatus.text = "🖐️ Hands: Failed"
-            }
-        }
-    }
-
     private fun loadModelFile(modelName: String): MappedByteBuffer {
         val fileDescriptor = assets.openFd(modelName)
         val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
@@ -238,6 +310,7 @@ class MainActivity : AppCompatActivity() {
     // YOLOX 진단 로그: 3초마다 한 번만 출력 (로그 과다 방지)
     private var lastYoloxDiagTimeMs = 0L
     private var firstInferenceLogged = false
+    private var lastTargetMatchDiagMs = 0L
 
     // 이미지 분석기
     private inner class ImageAnalyzer : ImageAnalysis.Analyzer {
@@ -257,19 +330,44 @@ class MainActivity : AppCompatActivity() {
                 bitmap = BitmapUtils.rotateBitmap(bitmap, rotationDegrees) ?: bitmap
             }
 
-            // 1. YOLOX 추론
-            val detections = runYOLOX(bitmap)
-
-            // 2. MediaPipe Hands: LIVE_STREAM → 비동기 전달만 하고 즉시 return (블로킹 없음)
-            sendFrameToHands(bitmap, imageProxy.imageInfo.timestamp)
-
-            // 3. 결과 표시 (Hands는 콜백으로 온 최신 결과 사용)
+            val w = bitmap.width
+            val h = bitmap.height
             val inferenceTime = System.currentTimeMillis() - startTime
-            displayResults(detections, latestHandsResult.get(), inferenceTime, bitmap.width, bitmap.height)
 
-            // FPS 계산
+            when (gyroManager.state) {
+                GyroTrackingManager.State.SCANNING -> {
+                    val result = gyroManager.processFrameSearching(bitmap)
+                    when (result) {
+                        is GyroTrackingManager.ProcessResult.Scanning ->
+                            displayResults(result.detections, inferenceTime, w, h)
+                        is GyroTrackingManager.ProcessResult.SwitchedToLocked -> {
+                            updateFPS()
+                            imageProxy.close()
+                            return
+                        }
+                        else -> { }
+                    }
+                }
+                GyroTrackingManager.State.LOCKED -> {
+                    val result = gyroManager.processFrameLocked(bitmap)
+                    when (result) {
+                        is GyroTrackingManager.ProcessResult.Locked ->
+                            displayResults(listOf(result.box), inferenceTime, frozenImageWidth, frozenImageHeight)
+                        is GyroTrackingManager.ProcessResult.ReturnedToSearching -> {
+                            updateFPS()
+                            imageProxy.close()
+                            return
+                        }
+                        else -> {
+                            val box = frozenBox
+                            val boxes = if (box != null) listOf(box) else emptyList()
+                            displayResults(boxes, inferenceTime, frozenImageWidth, frozenImageHeight)
+                        }
+                    }
+                }
+            }
+
             updateFPS()
-
             imageProxy.close()
         }
 
@@ -458,9 +556,12 @@ class MainActivity : AppCompatActivity() {
             if (confidence > maxConfidenceSeen) maxConfidenceSeen = confidence
             if (confidence < minConfidenceToShow) continue
 
-            val topLabels = topClassIds.map { (cid, conf) ->
-                getClassLabel(cid) to (conf * 100).toInt()
-            }
+            // 50% 이상인 클래스만 표시 (상위 3개 중에서)
+            val topLabels = topClassIds
+                .filter { (_, conf) -> conf >= 0.5f }
+                .map { (cid, conf) ->
+                    getClassLabel(cid) to (conf * 100).toInt()
+                }
 
             // 좌표: 정규화 0~1이고 v2>v0, v3>v1 이면 (x1,y1,x2,y2). 아니면 (cx,cy,w,h).
             val left: Float
@@ -539,46 +640,39 @@ class MainActivity : AppCompatActivity() {
         return interArea / (areaA + areaB - interArea + 1e-6f)
     }
 
-    /** LIVE_STREAM: 프레임만 넘기고 즉시 return. 결과는 resultListener 콜백으로 옴. */
-    private fun sendFrameToHands(bitmap: Bitmap, timestampNs: Long) {
-        if (handLandmarker == null) return
-        try {
-            val mpImage = BitmapImageBuilder(bitmap).build()
-            val timestampMs = timestampNs / 1_000_000
-            handLandmarker!!.detectAsync(mpImage, timestampMs)
-        } catch (e: Exception) {
-            Log.e(TAG, "Hands detectAsync 실패", e)
-        }
-    }
-
     private fun displayResults(
         detections: List<OverlayView.DetectionBox>,
-        handsResult: HandLandmarkerResult?,
         inferenceTime: Long,
         imageWidth: Int,
         imageHeight: Int
     ) {
         runOnUiThread {
-            // 오버레이 업데이트 (이미지 크기 전달로 박스 스케일링)
             binding.overlayView.setDetections(detections, imageWidth, imageHeight)
-            binding.overlayView.setHands(handsResult)
 
-            // 모델이 감지한 객체 개수 + 최고 확률
-            binding.yoloxStatus.text = "📦 YOLOX: ${detections.size}개 감지 (maxConf=${String.format("%.2f", lastYoloxMaxConf)})"
-
-            val handsCount = handsResult?.landmarks()?.size ?: 0
-            binding.handsStatus.text = "🖐️ Hands: $handsCount detected"
+            when (searchState) {
+                SearchState.SEARCHING -> {
+                    binding.yoloxStatus.text = "🔍 탐색: ${getTargetLabel()} (${detections.size}개 감지)"
+                    binding.handsStatus.text = "📐 자이로: OFF"
+                }
+                SearchState.LOCKED -> {
+                    val box = frozenBox
+                    if (box != null) {
+                        binding.yoloxStatus.text = "🔒 고정: ${box.label} (자이로)"
+                    }
+                    binding.handsStatus.text = "📐 자이로: ON"
+                }
+            }
 
             binding.inferenceTime.text = "⏱️ Inference: ${inferenceTime}ms"
 
-            // 디버깅: YOLOX shape + 감지별 상세 (클래스 | 신뢰도 | L,T,R,B)
             val detailLines = detections.take(10).mapIndexed { i, d ->
                 "${i + 1}) ${d.label} conf=${String.format("%.2f", d.confidence)} L=${d.rect.left.toInt()},T=${d.rect.top.toInt()},R=${d.rect.right.toInt()},B=${d.rect.bottom.toInt()}"
             }
             val debugText = buildString {
                 yoloxShapeInfo?.let { append(it).append("\n") }
                 if (detailLines.isNotEmpty()) {
-                    append("감지상세(클래스|신뢰도|좌표):\n")
+                    append(if (searchState == SearchState.LOCKED) "고정된 영역:" else "감지상세(클래스|신뢰도|좌표):")
+                    append("\n")
                     append(detailLines.joinToString("\n"))
                 }
             }
@@ -611,7 +705,7 @@ class MainActivity : AppCompatActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_CODE_PERMISSIONS) {
             if (allPermissionsGranted()) {
-                startCamera()
+                binding.startSearchBtn.visibility = View.VISIBLE
             } else {
                 Toast.makeText(this, "카메라 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
                 finish()
@@ -624,8 +718,7 @@ class MainActivity : AppCompatActivity() {
         cameraExecutor.shutdown()
         yoloxInterpreter?.close()
         gpuDelegate?.close()
-        handLandmarker?.close()
-
+        gyroManager.resetToSearchingFromUI()
     }
 
     companion object {
