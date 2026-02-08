@@ -109,13 +109,14 @@ class MainActivity : AppCompatActivity() {
     private fun initGyroTrackingManager() {
         gyroManager = GyroTrackingManager(
             context = this,
-            onBoxUpdate = { rect: RectF ->
+            onBoxUpdate = { update: BoxUpdate ->
                 runOnUiThread {
                     val box = OverlayView.DetectionBox(
                         label = lockedTargetLabel,
                         confidence = 0.9f,
-                        rect = rect,
-                        topLabels = listOf(lockedTargetLabel to 90)
+                        rect = update.rect,
+                        topLabels = listOf(lockedTargetLabel to 90),
+                        rotationDegrees = update.rotationDegrees
                     )
                     frozenBox = box
                     binding.overlayView.setDetections(listOf(box), frozenImageWidth, frozenImageHeight)

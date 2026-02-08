@@ -27,9 +27,12 @@ private const val OUT_OF_BOUNDS_MARGIN = 150f
 /** 연속 N프레임 화면 밖이어야 고정 해제 (노이즈로 인한 급격한 해제 방지) */
 private const val OUT_OF_BOUNDS_FRAMES_TO_LOSE = 15
 
+/** 회전 적용한 박스 업데이트: rect + 화면 롤(옆으로 눕힌 각도, 도) */
+data class BoxUpdate(val rect: RectF, val rotationDegrees: Float)
+
 class GyroTrackingManager(
     private val context: Context,
-    private val onBoxUpdate: (RectF) -> Unit,
+    private val onBoxUpdate: (BoxUpdate) -> Unit,
     private val onTrackingLost: () -> Unit
 ) : SensorEventListener {
 
@@ -45,6 +48,7 @@ class GyroTrackingManager(
     var isLocked = false
     private var timestamp: Long = 0
     private var outOfBoundsCount = 0
+    private var smoothedRollDegrees = 0f
 
     // 화면 크기 및 FOV
     private var screenWidth = 1080f
@@ -79,6 +83,7 @@ class GyroTrackingManager(
         isLocked = true
         timestamp = 0
         outOfBoundsCount = 0
+        smoothedRollDegrees = 0f
 
         rotationVectorSensor?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
@@ -173,14 +178,20 @@ class GyroTrackingManager(
 
         var deltaYaw = orientation[0] - initialOrientation[0]
         var deltaPitch = orientation[1] - initialOrientation[1]
+        var deltaRoll = orientation[2] - initialOrientation[2]
 
         if (deltaYaw > Math.PI) deltaYaw -= (2 * Math.PI).toFloat()
         if (deltaYaw < -Math.PI) deltaYaw += (2 * Math.PI).toFloat()
         if (deltaPitch > Math.PI) deltaPitch -= (2 * Math.PI).toFloat()
         if (deltaPitch < -Math.PI) deltaPitch += (2 * Math.PI).toFloat()
+        if (deltaRoll > Math.PI) deltaRoll -= (2 * Math.PI).toFloat()
+        if (deltaRoll < -Math.PI) deltaRoll += (2 * Math.PI).toFloat()
 
         if (abs(deltaYaw) < MIN_ROTATION_THRESHOLD) deltaYaw = 0f
         if (abs(deltaPitch) < MIN_ROTATION_THRESHOLD) deltaPitch = 0f
+
+        val deltaRollDegrees = Math.toDegrees(deltaRoll.toDouble()).toFloat()
+        smoothedRollDegrees += (deltaRollDegrees - smoothedRollDegrees) * SMOOTHING_ALPHA
 
         val rotationShiftX = deltaYaw * pixelsPerRadianX * SENSITIVITY_FACTOR
         val rotationShiftY = deltaPitch * pixelsPerRadianY * SENSITIVITY_FACTOR
@@ -190,8 +201,8 @@ class GyroTrackingManager(
         val translationShiftX = distanceX * pixelsPerMeterX
         val translationShiftY = distanceY * pixelsPerMeterY
 
-        val targetX = initialRect.left - rotationShiftX - translationShiftX
-        val targetY = initialRect.top - rotationShiftY - translationShiftY
+        val targetX = initialRect.left + rotationShiftX - translationShiftX
+        val targetY = initialRect.top + rotationShiftY - translationShiftY
 
         val newLeft = currentSmoothedRect.left + (targetX - currentSmoothedRect.left) * SMOOTHING_ALPHA
         val newTop = currentSmoothedRect.top + (targetY - currentSmoothedRect.top) * SMOOTHING_ALPHA
@@ -202,17 +213,18 @@ class GyroTrackingManager(
         val isOutOfBounds = currentSmoothedRect.right < -margin || currentSmoothedRect.left > screenWidth + margin ||
             currentSmoothedRect.bottom < -margin || currentSmoothedRect.top > screenHeight + margin
 
+        val update = BoxUpdate(currentSmoothedRect, smoothedRollDegrees)
         if (isOutOfBounds) {
             outOfBoundsCount++
             if (outOfBoundsCount >= OUT_OF_BOUNDS_FRAMES_TO_LOSE) {
                 stopTracking()
                 onTrackingLost()
             } else {
-                onBoxUpdate(currentSmoothedRect)
+                onBoxUpdate(update)
             }
         } else {
             outOfBoundsCount = 0
-            onBoxUpdate(currentSmoothedRect)
+            onBoxUpdate(update)
         }
     }
 
