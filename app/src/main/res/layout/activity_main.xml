@@ -82,6 +82,30 @@
                 android:visibility="gone"
                 android:textSize="12sp" />
 
+            <Button
+                android:id="@+id/confirmBtn"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="확인"
+                android:visibility="gone"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/reinputBtn"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="재입력"
+                android:visibility="gone"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/retryBtn"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="다시 찾기"
+                android:visibility="gone"
+                android:textSize="12sp" />
+
             <ImageButton
                 android:id="@+id/micButton"
                 android:layout_width="48dp"

@@ -23,6 +23,7 @@ class TTSManager(
 
     private var textToSpeech: TextToSpeech? = null
     private var isReady = false
+    private var pendingSpeakDoneCallback: (() -> Unit)? = null
 
     fun init(callback: (Boolean) -> Unit) {
         textToSpeech = TextToSpeech(context) { status ->
@@ -31,6 +32,7 @@ class TTSManager(
                 if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
                     Log.w(TAG, "한국어 TTS 미지원, 기본 언어 사용")
                 }
+                textToSpeech?.setSpeechRate(0.82f)
                 textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {
                         Log.d(TAG, "TTS 재생 시작")
@@ -38,11 +40,13 @@ class TTSManager(
 
                     override fun onDone(utteranceId: String?) {
                         Log.d(TAG, "TTS 재생 완료")
+                        pendingSpeakDoneCallback?.invoke()
+                        pendingSpeakDoneCallback = null
                         onSpeakDone()
                     }
 
-                    override fun onError(utteranceId: String?, errorCode: Int) {
-                        Log.e(TAG, "TTS onError: $errorCode")
+                    override fun onError(utteranceId: String?) {
+                        Log.e(TAG, "TTS onError: utteranceId=$utteranceId")
                         onError("TTS 재생 오류")
                     }
                 })
@@ -58,11 +62,14 @@ class TTSManager(
         }
     }
 
-    fun speak(text: String, queueMode: Int = TextToSpeech.QUEUE_FLUSH) {
+    fun speak(text: String, queueMode: Int = TextToSpeech.QUEUE_FLUSH, onDone: (() -> Unit)? = null) {
         if (!isReady || text.isBlank()) {
             Log.w(TAG, "speak: 준비되지 않았거나 텍스트가 비어있음")
+            onDone?.invoke()
             return
         }
+
+        pendingSpeakDoneCallback = onDone
 
         val params = Bundle().apply {
             putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, UTTERANCE_ID)
