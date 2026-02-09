@@ -75,8 +75,8 @@ class MainActivity : AppCompatActivity() {
     private var pendingLockBox: OverlayView.DetectionBox? = null
     private var pendingLockCount = 0
 
-    /** LOCKED 시 YOLOX 검증+보정: N프레임마다 1회 실행 (자이로 + 시각 보정) */
-    private val VALIDATION_INTERVAL = 4
+    /** LOCKED 시 YOLOX 검증+보정: N프레임마다 1회 실행 (3으로 줄여 드리프트 보정 빈도 증가) */
+    private val VALIDATION_INTERVAL = 3
     private val VALIDATION_FAIL_LIMIT = 3
     private var validationFailCount = 0
     private var lockedFrameCount = 0
@@ -233,8 +233,7 @@ class MainActivity : AppCompatActivity() {
                 binding.confirmBtn.visibility = View.GONE
                 binding.reinputBtn.visibility = View.GONE
                 binding.retryBtn.visibility = View.GONE
-                binding.previewView.visibility = View.GONE
-                binding.overlayView.visibility = View.GONE
+                // preview/overlay는 건드리지 않음 (버튼으로 카메라 켠 뒤 STT 콜백 시 꺼지던 현상 방지)
             }
             else -> {
                 binding.confirmBtn.visibility = View.GONE
@@ -356,7 +355,7 @@ class MainActivity : AppCompatActivity() {
             val options = HandLandmarker.HandLandmarkerOptions.builder()
                 .setBaseOptions(baseOptions)
                 .setRunningMode(RunningMode.LIVE_STREAM)
-                .setNumHands(2)
+                .setNumHands(1)
                 .setMinHandDetectionConfidence(0.5f)
                 .setMinHandPresenceConfidence(0.5f)
                 .setMinTrackingConfidence(0.5f)
@@ -666,8 +665,10 @@ class MainActivity : AppCompatActivity() {
             val h = bitmap.height
             val inferenceTime = System.currentTimeMillis() - startTime
 
-            // MediaPipe Hands: LIVE_STREAM → 비동기 전달만 하고 즉시 return (블로킹 없음)
-            sendFrameToHands(bitmap, imageProxy.imageInfo.timestamp)
+            // 손 인식: LOCKED일 때만 실행 (occlusion/optical flow용). SEARCHING에서는 파이프라인 비활성화
+            if (searchState == SearchState.LOCKED) {
+                sendFrameToHands(bitmap, imageProxy.imageInfo.timestamp)
+            }
 
             when (searchState) {
                 SearchState.SEARCHING -> {
@@ -743,8 +744,17 @@ class MainActivity : AppCompatActivity() {
                             val tracked = findTrackedTarget(detections, lockedTargetLabel, frozenBox, minConf)
                             if (tracked != null) {
                                 validationFailCount = 0
-                                gyroManager.correctPosition(tracked.rect)
-                                frozenBox = tracked.copy(rotationDegrees = 0f)
+                                // 한 프레임 점프 방지: 현재 박스 70% + YOLOX 30% 블렌딩
+                                val cur = frozenBox?.rect ?: tracked.rect
+                                val blend = 0.7f
+                                val blendedRect = RectF(
+                                    cur.left * blend + tracked.rect.left * (1f - blend),
+                                    cur.top * blend + tracked.rect.top * (1f - blend),
+                                    cur.right * blend + tracked.rect.right * (1f - blend),
+                                    cur.bottom * blend + tracked.rect.bottom * (1f - blend)
+                                )
+                                gyroManager.correctPosition(blendedRect)
+                                frozenBox = tracked.copy(rect = blendedRect, rotationDegrees = 0f)
                                 frozenImageWidth = w
                                 frozenImageHeight = h
                             } else {
@@ -1087,7 +1097,9 @@ class MainActivity : AppCompatActivity() {
     ) {
         runOnUiThread {
             binding.overlayView.setDetections(detections, imageWidth, imageHeight)
-            binding.overlayView.setHands(latestHandsResult.get())
+            binding.overlayView.setHands(
+                if (searchState == SearchState.LOCKED) latestHandsResult.get() else null
+            )
 
             when (searchState) {
                 SearchState.SEARCHING -> {
