@@ -233,8 +233,7 @@ class MainActivity : AppCompatActivity() {
                 binding.confirmBtn.visibility = View.GONE
                 binding.reinputBtn.visibility = View.GONE
                 binding.retryBtn.visibility = View.GONE
-                binding.previewView.visibility = View.GONE
-                binding.overlayView.visibility = View.GONE
+                // preview/overlay는 건드리지 않음 (버튼으로 카메라 켠 뒤 STT 콜백 시 꺼지던 현상 방지)
             }
             else -> {
                 binding.confirmBtn.visibility = View.GONE
