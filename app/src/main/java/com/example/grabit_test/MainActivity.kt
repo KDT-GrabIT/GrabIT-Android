@@ -75,8 +75,8 @@ class MainActivity : AppCompatActivity() {
     private var pendingLockBox: OverlayView.DetectionBox? = null
     private var pendingLockCount = 0
 
-    /** LOCKED 시 YOLOX 검증+보정: N프레임마다 1회 실행 (자이로 + 시각 보정) */
-    private val VALIDATION_INTERVAL = 4
+    /** LOCKED 시 YOLOX 검증+보정: N프레임마다 1회 실행 (3으로 줄여 드리프트 보정 빈도 증가) */
+    private val VALIDATION_INTERVAL = 3
     private val VALIDATION_FAIL_LIMIT = 3
     private var validationFailCount = 0
     private var lockedFrameCount = 0
@@ -744,8 +744,17 @@ class MainActivity : AppCompatActivity() {
                             val tracked = findTrackedTarget(detections, lockedTargetLabel, frozenBox, minConf)
                             if (tracked != null) {
                                 validationFailCount = 0
-                                gyroManager.correctPosition(tracked.rect)
-                                frozenBox = tracked.copy(rotationDegrees = 0f)
+                                // 한 프레임 점프 방지: 현재 박스 70% + YOLOX 30% 블렌딩
+                                val cur = frozenBox?.rect ?: tracked.rect
+                                val blend = 0.7f
+                                val blendedRect = RectF(
+                                    cur.left * blend + tracked.rect.left * (1f - blend),
+                                    cur.top * blend + tracked.rect.top * (1f - blend),
+                                    cur.right * blend + tracked.rect.right * (1f - blend),
+                                    cur.bottom * blend + tracked.rect.bottom * (1f - blend)
+                                )
+                                gyroManager.correctPosition(blendedRect)
+                                frozenBox = tracked.copy(rect = blendedRect, rotationDegrees = 0f)
                                 frozenImageWidth = w
                                 frozenImageHeight = h
                             } else {
