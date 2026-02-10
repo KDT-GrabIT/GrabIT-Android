@@ -20,6 +20,11 @@ class OverlayView @JvmOverloads constructor(
     private var imageHeight = 0
     private var isFrozen = false
 
+    /** 디버그: near-contact 엄지·검지 중간점 (이미지 픽셀). null이면 그리지 않음 */
+    private var touchDebugPx: Pair<Float, Float>? = null
+    /** 디버그: 터치 중간점 그리기 켜기 (개발용 토글) */
+    private var showTouchDebug = true
+
     // Paint 객체들
     private val boxPaint = Paint().apply {
         color = Color.GREEN
@@ -62,6 +67,13 @@ class OverlayView @JvmOverloads constructor(
         strokeWidth = 3f
     }
 
+    /** near-contact 판정용 엄지·검지 중간점 (디버그용 작은 점) */
+    private val touchMidpointPaint = Paint().apply {
+        color = Color.YELLOW
+        style = Paint.Style.FILL
+        isAntiAlias = true
+    }
+
     data class DetectionBox(
         val label: String,
         val confidence: Float,
@@ -87,6 +99,18 @@ class OverlayView @JvmOverloads constructor(
     /** 고정 모드 (State B): 박스가 고정되어 추적하지 않음 */
     fun setFrozen(frozen: Boolean) {
         isFrozen = frozen
+        invalidate()
+    }
+
+    /** 디버그: 엄지·검지 중간점(이미지 픽셀) 설정. null이면 표시 안 함 */
+    fun setTouchDebugPoint(px: Float?, py: Float?) {
+        touchDebugPx = if (px != null && py != null) Pair(px, py) else null
+        invalidate()
+    }
+
+    /** 디버그: 터치 중간점 그리기 토글 */
+    fun setShowTouchDebug(show: Boolean) {
+        showTouchDebug = show
         invalidate()
     }
 
@@ -122,6 +146,14 @@ class OverlayView @JvmOverloads constructor(
                 canvas.drawCircle(px, py, 8f, handPointPaint)
             }
             drawHandConnections(canvas, hand)
+        }
+
+        // 디버그: near-contact 엄지·검지 중간점 (이미지 픽셀 → 뷰 좌표)
+        if (showTouchDebug && touchDebugPx != null && imageWidth > 0 && imageHeight > 0) {
+            val (ix, iy) = touchDebugPx!!
+            val vx = ix * scaleX
+            val vy = iy * scaleY
+            canvas.drawCircle(vx, vy, 12f, touchMidpointPaint)
         }
     }
 
