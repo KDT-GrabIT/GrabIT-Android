@@ -2,6 +2,8 @@ package com.example.grabitTest
 
 import android.content.Context
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
@@ -19,11 +21,15 @@ class TTSManager(
     companion object {
         private const val TAG = "TTSManager"
         private const val UTTERANCE_ID = "TTSManager_utterance"
+        /** onDone 미호출 시 폴백 (일부 기기에서 TTS 콜백 누락 방지) */
+        private const val SPEAK_DONE_TIMEOUT_MS = 8000L
     }
 
     private var textToSpeech: TextToSpeech? = null
     private var isReady = false
     private var pendingSpeakDoneCallback: (() -> Unit)? = null
+    private val handler = Handler(Looper.getMainLooper())
+    private var speakDoneTimeoutRunnable: Runnable? = null
 
     fun init(callback: (Boolean) -> Unit) {
         textToSpeech = TextToSpeech(context) { status ->
@@ -40,6 +46,7 @@ class TTSManager(
 
                     override fun onDone(utteranceId: String?) {
                         Log.d(TAG, "TTS 재생 완료")
+                        cancelSpeakDoneTimeout()
                         pendingSpeakDoneCallback?.invoke()
                         pendingSpeakDoneCallback = null
                         onSpeakDone()
@@ -69,20 +76,43 @@ class TTSManager(
             return
         }
 
+        cancelSpeakDoneTimeout()
         pendingSpeakDoneCallback = onDone
 
         val params = Bundle().apply {
             putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, UTTERANCE_ID)
         }
 
+        // TTS_TRACE: 실제 발화 문자열과 호출자 추적
+        runCatching {
+            val st = Throwable().stackTrace
+            val caller = st.take(6).joinToString("\n")
+            Log.e(TAG, "[TTS_TRACE] speakText='${text.trim()}', queueMode=$queueMode\ncaller=\n$caller")
+        }
+
         @Suppress("DEPRECATION")
         val result = textToSpeech?.speak(text.trim(), queueMode, params, UTTERANCE_ID)
         if (result == TextToSpeech.ERROR) {
             Log.e(TAG, "speak 실패")
+            cancelSpeakDoneTimeout()
+            pendingSpeakDoneCallback = null
             onError("음성 출력 실패")
         } else {
             Log.d(TAG, "TTS speak 요청: $text")
+            speakDoneTimeoutRunnable = Runnable {
+                Log.w(TAG, "TTS onDone 타임아웃 (폴백)")
+                speakDoneTimeoutRunnable = null
+                pendingSpeakDoneCallback?.invoke()
+                pendingSpeakDoneCallback = null
+                onSpeakDone()
+            }
+            handler.postDelayed(speakDoneTimeoutRunnable!!, SPEAK_DONE_TIMEOUT_MS)
         }
+    }
+
+    private fun cancelSpeakDoneTimeout() {
+        speakDoneTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        speakDoneTimeoutRunnable = null
     }
 
     fun stop() {
@@ -94,6 +124,8 @@ class TTSManager(
 
     fun release() {
         try {
+            cancelSpeakDoneTimeout()
+            pendingSpeakDoneCallback = null
             textToSpeech?.stop()
             textToSpeech?.shutdown()
             textToSpeech = null

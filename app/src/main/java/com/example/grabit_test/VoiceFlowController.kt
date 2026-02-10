@@ -31,7 +31,7 @@ class VoiceFlowController(
             "'다시'라고 말씀하시면 마지막 안내를 다시 들으실 수 있습니다."
 
         fun msgConfirmProduct(productName: String) =
-            "찾으시는 상품이 ${productName} 맞습니까? 아니라면 상품이름을 다시 말해주세요."
+            "찾으시는 상품이 ${productName} 맞습니까? 맞으면 '예'라고 말해주세요."
 
         fun msgSearching(productName: String) = "${productName}을 찾고 있습니다. 잠시만 기다려주세요."
 
@@ -119,36 +119,30 @@ class VoiceFlowController(
     }
 
     private fun handleConfirmationReceived(text: String) {
-        when {
-            isConfirmationYes(text) -> {
-                transitionTo(VoiceFlowState.SEARCHING_PRODUCT)
-                val msg = msgSearching(currentProductName)
-                speak(msg)
-                onStartSearch(currentProductName)
-            }
-            isConfirmationNo(text) -> {
-                currentProductName = ""
-                transitionTo(VoiceFlowState.WAITING_PRODUCT_NAME)
-                speak(MSG_ASK_PRODUCT) {
-                    beepPlayer.playBeep {
-                        onRequestStartStt()
-                    }
-                }
-            }
-            isRepeatCommand(text) -> repeatLast()
-            isHelpCommand(text) -> speakHelp()
-            else -> {
-                // 애매한 답변은 긍정으로 간주 (예/네/맞아요/응 등이 아니어도)
-                if (text.length <= 5) {
-                    transitionTo(VoiceFlowState.SEARCHING_PRODUCT)
-                    val msg = msgSearching(currentProductName)
-                    speak(msg)
-                    onStartSearch(currentProductName)
-                } else {
-                    repeatLast()
-                }
-            }
+        val normalized = text.trim()
+        val isYes = isConfirmationYes(normalized)
+        var branchChosen = "INIT"
+        var startSearchCalled = false
+        val currentTargetSnapshot = currentProductName
+
+        if (isYes) {
+            branchChosen = "YES"
+            transitionTo(VoiceFlowState.SEARCHING_PRODUCT)
+            val msg = msgSearching(currentProductName)
+            speak(msg)
+            onStartSearch(currentProductName)
+            startSearchCalled = true
+        } else {
+            branchChosen = "NON_YES_RESET"
+            resetToAppStartWithRestartPrompt()
         }
+
+        Log.d(
+            TAG,
+            "handleConfirmationReceived: state=$currentState, recognizedText='$normalized', " +
+                "isYes=$isYes, branchChosen=$branchChosen, startSearchCalled=$startSearchCalled, " +
+                "currentTarget='$currentTargetSnapshot'"
+        )
     }
 
     private fun isConfirmationYes(text: String): Boolean {
@@ -169,12 +163,22 @@ class VoiceFlowController(
     private fun isRepeatCommand(text: String) =
         text.contains("다시") || text.contains("재생") || text.equals("repeat", ignoreCase = true)
 
+    private fun resetToAppStartWithRestartPrompt() {
+        currentProductName = ""
+        transitionTo(VoiceFlowState.APP_START)
+        // 확인 단계 이후에는 YES가 아닐 경우 언제나 초기 화면으로 복귀 + 동일 안내 멘트
+        ttsManager.stop()
+        speak(VoicePrompts.PROMPT_TOUCH_RESTART)
+    }
+
     /** 확인/재입력 버튼 클릭 (접근성용 보조) */
     fun onConfirmClicked() {
         if (currentState == VoiceFlowState.CONFIRM_PRODUCT || currentState == VoiceFlowState.WAITING_CONFIRMATION) {
-            transitionTo(VoiceFlowState.SEARCHING_PRODUCT)
-            speak(msgSearching(currentProductName))
-            onStartSearch(currentProductName)
+            Log.d(
+                TAG,
+                "onConfirmClicked: state=$currentState, currentProductName='$currentProductName' → restartToAppStart"
+            )
+            resetToAppStartWithRestartPrompt()
         }
     }
 

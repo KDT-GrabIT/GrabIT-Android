@@ -95,7 +95,6 @@ class MainActivity : AppCompatActivity() {
     private var wasOccluded = false  // occlusion → non-occlusion 전환 시 gyro 동기화용
 
     private val TARGET_CONFIDENCE_THRESHOLD = 0.5f  // 50% 이상 확신 시 고정 (탐지 용이하게 완화)
-    private val TARGET_ANY = "모든 상품"
     private val currentTargetLabel = AtomicReference<String>("")
 
     // STT / TTS
@@ -128,9 +127,7 @@ class MainActivity : AppCompatActivity() {
     private var ttsGrabPlayed = false      // 손 뻗어 잡으세요 TTS (LOCKED 후)
     private var ttsGrabbedPlayed = false   // 객체 잡았음 TTS 1회만
     private var ttsAskAnotherPlayed = false
-    private var waitingForYesNo = false    // 예/아니오 STT 대기 중
-    private var waitingForTouchConfirm = false  // "닿았나요?" 예/아니오 대기 (닿음 감지 후)
-    private var waitingForProductNameAfterYes = false  // "어떤 상품을 찾을까요?" 후 상품명 STT 대기
+    private var waitingForTouchConfirm = false  // (단순화 후 사용 안 함)
     private var handsOverlapFrameCount = 0  // 손-박스 겹침 연속 프레임 수 (잘못된 잡기 판정용)
     private var pinchGrabFrameCount = 0     // 엄지+검지 잡기 판정 연속 프레임
 
@@ -143,6 +140,8 @@ class MainActivity : AppCompatActivity() {
     /** LOCKED 시 마지막으로 YOLOX 검증 성공한 시각. 박스를 잃은 뒤 2초 지나면 추론을 매 프레임 켜서 재탐지 */
     private var lastSuccessfulValidationTimeMs = 0L
     private val REACQUIRE_INFERENCE_AFTER_MS = 2000L
+    /** near-contact 후 질문(STT) 플로우가 이미 진행 중인지 여부 (중복 트리거 방지) */
+    private var touchConfirmInProgress = false
 
     // ---------- near-contact(touch) 판정 (시각장애인 UX, 현장 튜닝 포인트) ----------
     /** 타겟 박스 확장 비율 (0.1~0.2). 확장된 박스 안에 엄지·검지 중간점이 있으면 touch */
@@ -212,9 +211,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 햄버거 메뉴 - 찾을 수 있는 품목 리스트 Drawer */
+    /** 햄버거 메뉴 - 찾을 수 있는 품목 리스트 Drawer (특정 상품만, 모든 상품 옵션 없음) */
     private fun setupProductDrawer() {
-        val productList = listOf(TARGET_ANY) + classLabels
+        val productList = classLabels
         binding.productListView.adapter = ArrayAdapter(this, R.layout.item_product, R.id.itemProductName, productList)
         binding.productListView.setOnItemClickListener { _, _, position, _ ->
             val label = productList.getOrNull(position) ?: return@setOnItemClickListener
@@ -240,7 +239,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun playWelcomeTTS() {
-        speak("화면을 터치해서 상품찾기를 시작해주세요.")
+        speak(VoicePrompts.PROMPT_IDLE_TOUCH)
     }
 
     private fun showFirstScreen() {
@@ -277,6 +276,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun onFirstScreenClicked() {
         if (screenState != ScreenState.FIRST_SCREEN) return
+        if (!allPermissionsGranted()) {
+            Toast.makeText(this, "마이크 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
+            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
+            return
+        }
+        if (voiceFlowController == null) {
+            Toast.makeText(this, "준비 중입니다. 잠시 후 다시 터치해주세요.", Toast.LENGTH_SHORT).show()
+            return
+        }
         // 화면 터치 시에만 마이크 켜고 상품명 입력 받기
         voiceFlowController?.startProductNameInput()
     }
@@ -303,7 +311,16 @@ class MainActivity : AppCompatActivity() {
                         beepPlayer = beepPlayer!!,
                         onStateChanged = { _, _ -> runOnUiThread { updateVoiceFlowButtonVisibility() } },
                         onSystemAnnounce = { msg -> runOnUiThread { binding.sttResultText.text = "🔊 $msg" } },
-                        onRequestStartStt = { runOnUiThread { sttManager?.startListening() } },
+                        onRequestStartStt = {
+                    runOnUiThread {
+                        // 삐 소리 후 오디오 정착 시간 확보 (마이크 미작동/인식 실패 방지)
+                        Log.d("STT", "MainActivity: onRequestStartStt() → will call startListening after 350ms (voice flow)")
+                        binding.root.postDelayed({
+                            Log.d("STT", "MainActivity: onRequestStartStt() delayed → startListening()")
+                            sttManager?.startListening()
+                        }, 350L)
+                    }
+                },
                         onStartSearch = { productName -> runOnUiThread { onStartSearchFromVoiceFlow(productName) } },
                         onProductNameEntered = { productName -> runOnUiThread { setTargetFromSpokenProductName(productName) } }
                     )
@@ -323,38 +340,9 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     Log.d(TAG, "[STT 결과] $text")
                     binding.sttResultText.text = "🎤 $text"
-                    if (waitingForYesNo) {
-                        waitingForYesNo = false
-                        handleYesNoAfterGrab(text)
-                        return@runOnUiThread
-                    }
                     if (waitingForTouchConfirm) {
                         waitingForTouchConfirm = false
                         handleTouchConfirmYesNo(text)
-                        return@runOnUiThread
-                    }
-                    if (waitingForProductNameAfterYes) {
-                        waitingForProductNameAfterYes = false
-                        binding.sttProgress.visibility = View.GONE
-                        if (text.isNotEmpty()) {
-                            val matchedLabel = mapSpokenToClass(text)
-                            if (matchedLabel == TARGET_ANY || matchedLabel.isBlank()) {
-                                speak("해당 상품은 목록에 없습니다. 찾을 수 있는 상품을 다시 말해주세요.") {
-                                    runOnUiThread { startSTTForProductName() }
-                                }
-                                return@runOnUiThread
-                            }
-                            currentTargetLabel.set(matchedLabel)
-                            val spinnerItems = listOf(TARGET_ANY) + classLabels
-                            val idx = spinnerItems.indexOf(matchedLabel)
-                            if (idx >= 0) binding.targetSpinner.setSelection(idx)
-                            binding.statusText.text = "찾는 중: ${getTargetLabel()}"
-                            val speakName = if (ProductDictionary.isLoaded()) ProductDictionary.getDisplayNameKo(matchedLabel) else matchedLabel
-                            speak("$speakName 찾겠습니다.") { transitionToSearching() }
-                        } else {
-                            Toast.makeText(this@MainActivity, "다시 말해주세요.", Toast.LENGTH_SHORT).show()
-                            transitionToSearching()
-                        }
                         return@runOnUiThread
                     }
                     voiceFlowController?.onSttResult(text)
@@ -370,14 +358,45 @@ class MainActivity : AppCompatActivity() {
                         touchActive = false
                         startPositionAnnounce()
                         Toast.makeText(this, "음성 인식 실패. 다시 시도해주세요.", Toast.LENGTH_SHORT).show()
-                    } else if (waitingForProductNameAfterYes) {
-                        waitingForProductNameAfterYes = false
-                        binding.sttProgress.visibility = View.GONE
-                        binding.statusText.text = "찾는 중: ${getTargetLabel()}"
-                        Toast.makeText(this, "음성 인식 실패. 다시 시도해주세요.", Toast.LENGTH_SHORT).show()
-                        transitionToSearching()
                     } else {
                         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+                    }
+                }
+            },
+            onErrorWithCode = { msg, errorCode ->
+                runOnUiThread {
+                    Log.e(TAG, "[STT onErrorWithCode] code=$errorCode, msg=$msg")
+                    val state = voiceFlowController?.currentState
+                    val isNoMatchOrTimeout =
+                        errorCode == android.speech.SpeechRecognizer.ERROR_NO_MATCH ||
+                            errorCode == android.speech.SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+
+                    // 상품명/확인 대기 상태에서 NO_MATCH 또는 TIMEOUT이면, 재시도 없이 재시작 안내 후 S0로 복귀
+                    if (isNoMatchOrTimeout &&
+                        (state == VoiceFlowController.VoiceFlowState.WAITING_PRODUCT_NAME ||
+                                state == VoiceFlowController.VoiceFlowState.WAITING_CONFIRMATION)
+                    ) {
+                        speak(VoicePrompts.PROMPT_TOUCH_RESTART) {
+                            voiceFlowController?.start()
+                            showFirstScreen()
+                        }
+                        return@runOnUiThread
+                    }
+
+                    // 그 외에는 RECOGNIZER_BUSY 에 한해 짧게 재시도
+                    val isRetryable = errorCode == android.speech.SpeechRecognizer.ERROR_RECOGNIZER_BUSY
+                    val shouldRetry = isRetryable && (
+                        state == VoiceFlowController.VoiceFlowState.WAITING_PRODUCT_NAME ||
+                            state == VoiceFlowController.VoiceFlowState.WAITING_CONFIRMATION
+                        )
+                    if (shouldRetry) {
+                        val delayMs = 800L
+                        binding.sttResultText.text = "다시 듣는 중..."
+                        Log.d("STT", "MainActivity: STT retry after error=$errorCode delayMs=$delayMs")
+                        binding.root.postDelayed({
+                            Log.d("STT", "MainActivity: STT retry delayed → startListening()")
+                            sttManager?.startListening()
+                        }, delayMs)
                     }
                 }
             },
@@ -430,18 +449,18 @@ class MainActivity : AppCompatActivity() {
     /** 음성 플로우에서 확인 클릭 시: 첫 화면 숨기고 카메라 켠 뒤 탐지 시작. 입력된 상품만 탐지하도록 타겟을 반드시 특정 클래스로 설정. */
     private fun onStartSearchFromVoiceFlow(productName: String) {
         val targetClass = mapSpokenToClass(productName)
-        if (productName.isNotBlank() && (targetClass == TARGET_ANY || targetClass.isBlank())) {
-            speak("해당 상품은 목록에 없습니다. 찾을 수 있는 상품을 말해주세요.")
+        if (productName.isNotBlank() && targetClass.isBlank()) {
+            speak(VoicePrompts.PROMPT_PRODUCT_RECOGNITION_FAILED)
+            // 음성으로 다시 받지 않고, 터치로 재시작만 허용
+            voiceSearchTargetLabel = null
             return
         }
         cancelSearchTimeout()
+        transitionToSearching()
         voiceSearchTargetLabel = targetClass
         currentTargetLabel.set(targetClass)
-        val spinnerItems = listOf(TARGET_ANY) + classLabels
-        val idx = spinnerItems.indexOf(targetClass)
-        if (idx >= 0) {
-            binding.targetSpinner.setSelection(idx)
-        }
+        val idx = classLabels.indexOf(targetClass)
+        if (idx >= 0) binding.targetSpinner.setSelection(idx)
         binding.startSearchBtn.visibility = View.GONE
         screenState = ScreenState.CAMERA_SCREEN
         binding.firstScreen.visibility = View.GONE
@@ -454,28 +473,24 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun mapSpokenToClass(spoken: String): String {
-        if (spoken.isBlank()) return TARGET_ANY
+        if (spoken.isBlank()) return ""
         ProductDictionary.findClassByStt(spoken)?.let { return it }
         val s = spoken.trim().lowercase().replace(" ", "")
         for (label in classLabels) {
             val labelNorm = label.lowercase().replace("_", "")
             if (labelNorm.contains(s) || s.contains(labelNorm.take(3))) return label
         }
-        return TARGET_ANY
+        return ""
     }
 
-    /** 상품명 말한 직후 타겟을 해당 상품으로 설정. 목록에 없는 상품이면 타겟을 바꾸지 않음(모든 상품 모드로 넘어가지 않도록). */
+    /** 상품명 말한 직후 타겟을 해당 상품으로 설정. 목록에 없는 상품이면 타겟을 바꾸지 않음. */
     private fun setTargetFromSpokenProductName(productName: String) {
         val targetClass = mapSpokenToClass(productName)
-        if (productName.isNotBlank() && (targetClass == TARGET_ANY || targetClass.isBlank())) {
-            return
-        }
+        if (productName.isNotBlank() && targetClass.isBlank()) return
+
         currentTargetLabel.set(targetClass)
-        val spinnerItems = listOf(TARGET_ANY) + classLabels
-        val idx = spinnerItems.indexOf(targetClass)
-        if (idx >= 0) {
-            binding.targetSpinner.setSelection(idx)
-        }
+        val idx = classLabels.indexOf(targetClass)
+        if (idx >= 0) binding.targetSpinner.setSelection(idx)
     }
 
     private fun stopCamera() {
@@ -484,78 +499,55 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {}
     }
 
-    /** "다른 물건을 찾으시겠습니까?" 이후 예/아니오 STT 시작 */
-    private fun startSTTForYesNo() {
-        sttManager?.startListening()
-    }
-
-    /** "닿았나요?" 예/아니오 처리. 예 → "다른 물건 찾으시겠습니까?" 플로우, 아니오 → 알겠습니다 후 위치 안내 재개 */
+    /** TOUCH_CONFIRM: near-contact 후 "상품에 닿았나요?" 질문에 대한 응답 처리 */
     private fun handleTouchConfirmYesNo(text: String) {
         val t = text.trim().lowercase().replace(" ", "")
-        val isNo = t.contains("아니") || t.contains("틀렸") || t == "no" || t == "n"
-        if (isNo) {
-            speak("알겠습니다.") {
-                runOnUiThread {
-                    touchActive = false
-                    binding.statusText.text = "손을 뻗어 잡아주세요"
-                    startPositionAnnounce()
-                }
-            }
-        } else if (t.contains("예") || t.contains("네") || t.contains("응") || t.contains("어")) {
-            speak("다른 물건을 찾으시겠습니까?") {
-                runOnUiThread {
-                    waitingForYesNo = true
-                    startSTTForYesNo()
-                }
+        val isYes = t.contains("예") || t.contains("네") || t.contains("응") ||
+            t.contains("맞") || t == "yes" || t == "y"
+        if (isYes) {
+            Log.d(TAG, "[TOUCH_CONFIRM] POSITIVE, reset to IDLE")
+            speak(VoicePrompts.PROMPT_DONE) {
+                resetToIdleFromTouch()
             }
         } else {
-            speak("예 또는 아니오로 답해주세요. 닿았나요?") {
-                runOnUiThread {
-                    waitingForTouchConfirm = true
-                    sttManager?.startListening()
-                }
+            Log.d(TAG, "[TOUCH_CONFIRM] NON_POSITIVE, reset to IDLE with touch restart prompt")
+            speak(VoicePrompts.PROMPT_TOUCH_RESTART) {
+                resetToIdleFromTouch()
             }
         }
     }
 
-    /** 잡기 후 "다른 물건을 찾으시겠습니까?"에 대한 예/아니오 처리. 예 → 어떤 상품 찾을지 물어보고 STT */
-    private fun handleYesNoAfterGrab(text: String) {
-        val t = text.trim().lowercase().replace(" ", "")
-        val isNo = t.contains("아니") || t.contains("틀렸") || t.contains("다른") || t == "no" || t == "n"
-        if (isNo) {
-            speak("알겠습니다.") {
-                runOnUiThread {
-                    transitionToSearching()
-                    stopCamera()
-                    showFirstScreen()
-                    playWelcomeTTS()
-                }
-            }
-        } else if (t.contains("예") || t.contains("네") || t.contains("응") || t.contains("어")) {
-            speak("어떤 상품을 찾을까요?") {
-                runOnUiThread { startSTTForProductName() }
-            }
-        } else {
-            speak("예 또는 아니오로 답해주세요. 다른 물건을 찾으시겠습니까?") {
-                runOnUiThread {
-                    waitingForYesNo = true
-                    startSTTForYesNo()
-                }
+    /** near-contact 확정 시 TOUCH_CONFIRM 상태로 진입 (중복 트리거 방지) */
+    private fun enterTouchConfirm() {
+        if (touchConfirmInProgress) return
+        touchConfirmInProgress = true
+        waitingForTouchConfirm = true
+        Log.d(TAG, "[TOUCH_CONFIRM] enterTouchConfirm: target=${getTargetLabel()}")
+        // 질문 발화: "상품에 닿았나요? 닿았으면 '예'라고 말해주세요."
+        val question = "상품에 닿았나요? 닿았으면 예라고 말해주세요."
+        speak(question) {
+            runOnUiThread {
+                Log.d("STT", "MainActivity: enterTouchConfirm() → startListening() for touch confirm")
+                sttManager?.startListening()
             }
         }
     }
 
-    /** "어떤 상품을 찾을까요?" 이후 상품명 STT → 타겟 설정 후 탐색 (sttManager 사용) */
-    private fun startSTTForProductName() {
-        if (sttManager == null) {
-            Toast.makeText(this, "음성 인식을 사용할 수 없습니다.", Toast.LENGTH_SHORT).show()
+    /** TOUCH_CONFIRM 종료 후 완전 초기화(S0 IDLE) */
+    private fun resetToIdleFromTouch() {
+        runOnUiThread {
+            Log.d(TAG, "[TOUCH_CONFIRM] resetToIdleFromTouch")
+            touchConfirmInProgress = false
+            waitingForTouchConfirm = false
+            touchActive = false
+            touchFrameCount = 0
+            releaseFrameCount = 0
             transitionToSearching()
-            return
+            stopCamera()
+            showFirstScreen()
+            // 선택: IDLE 안내 TTS
+            playWelcomeTTS()
         }
-        binding.sttProgress.visibility = View.VISIBLE
-        binding.statusText.text = "찾을 상품을 말해주세요"
-        waitingForProductNameAfterYes = true
-        sttManager?.startListening()
     }
 
     private fun startSearchTimeout() {
@@ -582,7 +574,7 @@ class MainActivity : AppCompatActivity() {
         stopPositionAnnounce()
         positionAnnounceRunnable = object : Runnable {
             override fun run() {
-                if (waitingForTouchConfirm || waitingForYesNo) {
+                if (waitingForTouchConfirm) {
                     searchTimeoutHandler.postDelayed(this, POSITION_ANNOUNCE_INTERVAL_MS)
                     return
                 }
@@ -614,6 +606,7 @@ class MainActivity : AppCompatActivity() {
             sttManager?.stopListening()
         } else {
             binding.sttResultText.text = "🎤 듣는 중..."
+            Log.d("STT", "MainActivity: onMicButtonClicked() → startListening() (manual)")
             sttManager?.startListening()
         }
     }
@@ -667,9 +660,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupTargetSpinner() {
-        val spinnerItems = listOf(TARGET_ANY) + classLabels
+        val spinnerItems = classLabels
         binding.targetSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, spinnerItems)
-        currentTargetLabel.set(TARGET_ANY)
+        currentTargetLabel.set("")
         binding.targetSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(p0: AdapterView<*>?, p1: View?, pos: Int, p3: Long) {
                 currentTargetLabel.set(spinnerItems.getOrNull(pos) ?: "")
@@ -680,11 +673,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun getTargetLabel(): String = currentTargetLabel.get().trim()
 
-    /** 음성으로 특정 상품을 말한 경우만 true. "모든 상품"이거나 비어 있으면 false. */
-    private fun isSpecificTarget(): Boolean {
-        val t = getTargetLabel()
-        return t.isNotEmpty() && t != TARGET_ANY
-    }
+    /** 특정 상품이 선택된 경우만 true. 비어 있으면 탐지 시작 안 함. */
+    private fun hasSpecificTarget(): Boolean = getTargetLabel().isNotEmpty()
 
     /** LOCKED 시 시각 보정: 이전 박스와 IoU가 가장 큰 타겟 detection 반환. 없으면 null
      * @param minConfidence occlusion 시 더 낮은 기준 사용 (예: 0.15f) */
@@ -717,10 +707,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 타겟에 맞는 detection만 반환. "모든 상품"이면 전부, 특정 상품이면 해당 상품만. */
+    /** 타겟에 맞는 detection만 반환. 타겟이 없으면 빈 리스트(탐지 안 함). */
     private fun filterDetectionsByTarget(detections: List<OverlayView.DetectionBox>, targetLabel: String): List<OverlayView.DetectionBox> {
         val target = targetLabel.trim()
-        if (target.isBlank() || target == TARGET_ANY) return detections
+        if (target.isBlank()) return emptyList()
 
         return detections
             .mapNotNull { box ->
@@ -739,18 +729,10 @@ class MainActivity : AppCompatActivity() {
             }
     }
 
-    /** 타겟이 primary label 또는 topLabels에 있고 confidence >= 70%인 detection 중 최고 확률 선택.
-     *  "모든 상품" 선택 시: confidence >= 70%인 detection 중 최고 확률 반환.
-     *  @return Pair(매칭된 박스, 실제 1순위 라벨). 음성 플로우에서 '찾았다' 판단 시 실제 라벨 사용. */
+    /** 타겟에 맞는 detection만 반환. 타겟이 없으면 null(탐지/락 안 함). */
     private fun findTargetMatch(detections: List<OverlayView.DetectionBox>, targetLabel: String): Pair<OverlayView.DetectionBox, String>? {
         val target = targetLabel.trim()
         if (target.isBlank()) return null
-
-        if (target == TARGET_ANY) {
-            val box = detections.filter { it.confidence >= TARGET_CONFIDENCE_THRESHOLD }.maxByOrNull { it.confidence }
-                ?: return null
-            return box to box.label
-        }
 
         return detections
             .mapNotNull { box ->
@@ -804,7 +786,7 @@ class MainActivity : AppCompatActivity() {
                 cancelSearchTimeout()
                 val requested = voiceSearchTargetLabel
                 val actualLabel = actualPrimaryLabel ?: box.label
-                val isRequestedProduct = requested == null || requested == TARGET_ANY || requested == actualLabel
+                val isRequestedProduct = requested.isNullOrBlank() || requested == actualLabel
                 if (isRequestedProduct) {
                     voiceSearchTargetLabel = null
                     voiceFlowController?.onSearchComplete(true, actualLabel, box.rect, imageWidth, imageHeight)
@@ -1013,6 +995,9 @@ class MainActivity : AppCompatActivity() {
 
             when (searchState) {
                 SearchState.SEARCHING -> {
+                    if (!hasSpecificTarget()) {
+                        displayResults(emptyList(), inferenceTime, w, h)
+                    } else {
                     val detections = runYOLOX(bitmap)
                     val matchResult = findTargetMatch(detections, getTargetLabel())
                     if (matchResult != null) {
@@ -1049,6 +1034,7 @@ class MainActivity : AppCompatActivity() {
                         pendingLockCount = 0
                     }
                     displayResults(filterDetectionsByTarget(detections, getTargetLabel()), inferenceTime, w, h)
+                    }
                 }
                 SearchState.LOCKED -> {
                     lockedFrameCount++
@@ -1071,7 +1057,7 @@ class MainActivity : AppCompatActivity() {
                     if (handTouch) {
                         touchFrameCount++
                         releaseFrameCount = 0
-                        if (!touchActive && touchFrameCount >= TOUCH_CONFIRM_FRAMES) {
+                        if (!touchActive && !touchConfirmInProgress && touchFrameCount >= TOUCH_CONFIRM_FRAMES) {
                             touchActive = true
                             val nowMs = System.currentTimeMillis()
                             if (nowMs - lastTouchTtsTimeMs >= TOUCH_TTS_COOLDOWN_MS) {
@@ -1079,13 +1065,7 @@ class MainActivity : AppCompatActivity() {
                                 runOnUiThread {
                                     stopPositionAnnounce()
                                     stopHandGuidanceTTS()
-                                    binding.statusText.text = "닿았나요?"
-                                    speak("손이 제품에 닿았어요. 닿았나요?") {
-                                        runOnUiThread {
-                                            waitingForTouchConfirm = true
-                                            sttManager?.startListening()
-                                        }
-                                    }
+                                    enterTouchConfirm()
                                 }
                                 Log.d(TAG, "[touch] touchActive=true, TTS 발화 (cooldown ${TOUCH_TTS_COOLDOWN_MS}ms)")
                             }
@@ -1608,7 +1588,7 @@ class MainActivity : AppCompatActivity() {
         stopHandGuidanceTTS()
         handGuidanceRunnable = object : Runnable {
             override fun run() {
-                if (searchState != SearchState.LOCKED || ttsGrabbedPlayed || waitingForYesNo) return
+                if (searchState != SearchState.LOCKED || ttsGrabbedPlayed) return
                 val box = frozenBox ?: return
                 val w = frozenImageWidth
                 val h = frozenImageHeight
@@ -1671,8 +1651,7 @@ class MainActivity : AppCompatActivity() {
                 binding.overlayView.setTouchDebugPoint(null, null)
             }
 
-            if (!waitingForYesNo) {
-                when (searchState) {
+            when (searchState) {
                     SearchState.SEARCHING -> binding.statusText.text = "찾는 중: ${getTargetLabel()}"
                     SearchState.LOCKED -> {
                         if (frozenBox != null) {
@@ -1683,7 +1662,6 @@ class MainActivity : AppCompatActivity() {
                             }
                         }
                     }
-                }
             }
         }
     }
@@ -1731,6 +1709,18 @@ class MainActivity : AppCompatActivity() {
         beepPlayer?.release()
         handLandmarker?.close()
         if (::gyroManager.isInitialized) gyroManager.stopTracking()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // 앱이 백그라운드로 나가면 카메라/음성 인식/타이머를 정리해 백그라운드 동작을 최소화
+        cancelSearchTimeout()
+        stopPositionAnnounce()
+        try {
+            stopCamera()
+        } catch (_: Exception) {}
+        sttManager?.stopListening()
+        ttsManager?.stop()
     }
 
     companion object {
