@@ -303,7 +303,12 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     Log.d(TAG, "[STT 결과] $text")
                     binding.sttResultText.text = "🎤 $text"
-                    voiceFlowController?.onSttResult(text)
+                    if (waitingForYesNo) {
+                        waitingForYesNo = false
+                        handleYesNoAfterGrab(text)
+                    } else {
+                        voiceFlowController?.onSttResult(text)
+                    }
                 }
             },
             onError = { msg ->
@@ -445,6 +450,23 @@ class MainActivity : AppCompatActivity() {
         } else {
             binding.sttResultText.text = "🎤 듣는 중..."
             sttManager?.startListening()
+        }
+    }
+
+    /** "다른 물건을 찾으시겠습니까?" 후 예/아니오 STT 시작 */
+    private fun startSTTForYesNo() {
+        sttManager?.startListening()
+    }
+
+    /** 잡기 후 "다른 물건을 찾으시겠습니까?"에 대한 예/아니오 처리 */
+    private fun handleYesNoAfterGrab(text: String) {
+        val t = text.trim().lowercase().replace(" ", "")
+        val isNo = t.contains("아니") || t.contains("틀렸") || t.contains("다른") || t == "no" || t == "n"
+        if (isNo) {
+            speak("알겠습니다.")
+        } else {
+            transitionToSearching()
+            voiceFlowController?.onRetrySearch()
         }
     }
 
