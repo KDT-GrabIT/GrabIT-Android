@@ -1,4 +1,4 @@
-plugins {
+ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
@@ -7,48 +7,52 @@ android {
     namespace = "com.example.grabitTest"
     compileSdk = 35
 
+    defaultConfig {
+        applicationId = "com.example.grabitTest"
+        minSdk = 24
+        targetSdk = 35
+        versionCode = 1
+        versionName = "1.0"
+        // NDK r28: 16KB 페이지 크기 기본 지원 (libc++_shared.so 등)
+        ndkVersion = "28.0.12433566"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+
     packaging {
         jniLibs {
             useLegacyPackaging = true
         }
-
-        defaultConfig {
-            applicationId = "com.example.grabitTest"
-            minSdk = 24
-            targetSdk = 35
-            versionCode = 1
-            versionName = "1.0"
-        }
-
-        buildTypes {
-            release {
-                isMinifyEnabled = false
-                proguardFiles(
-                    getDefaultProguardFile("proguard-android-optimize.txt"),
-                    "proguard-rules.pro"
-                )
-            }
-        }
-
-        compileOptions {
-            sourceCompatibility = JavaVersion.VERSION_1_8
-            targetCompatibility = JavaVersion.VERSION_1_8
-        }
-
-        kotlinOptions {
-            jvmTarget = "1.8"
-        }
-
-        buildFeatures {
-            viewBinding = true
-        }
     }
 
-    dependencies {
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+
+    kotlinOptions {
+        jvmTarget = "1.8"
+    }
+
+    buildFeatures {
+        viewBinding = true
+    }
+}
+
+dependencies {
         implementation("androidx.core:core-ktx:1.12.0")
         implementation("androidx.appcompat:appcompat:1.6.1")
         implementation("com.google.android.material:material:1.11.0")
         implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+        implementation("androidx.drawerlayout:drawerlayout:1.2.0")
 
         // 1. [수정] MediaPipe (0.10.14 -> 0.10.26)
         // 이전 버전(0.10.14)은 16KB를 지원하지 않아 에러의 주원인이 됩니다.
@@ -67,7 +71,6 @@ android {
         // Support 라이브러리도 LiteRT 버전으로 맞춤 (선택사항이나 충돌 방지 권장)
         implementation("com.google.ai.edge.litert:litert-support:1.4.1")
 
-        // 4. OpenCV (optical flow - occlusion 시 화면 이동량 추적)
-        implementation("org.opencv:opencv:4.9.0")
-    }
+        // 4. OpenCV 4.12.0: 16KB 페이지 크기 호환 (4.9.0은 LOAD 세그먼트 정렬 미지원)
+        implementation("org.opencv:opencv:4.12.0")
 }
