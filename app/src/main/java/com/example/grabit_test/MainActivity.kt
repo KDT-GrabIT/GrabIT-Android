@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
 import android.os.Bundle
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -677,6 +679,23 @@ class MainActivity : AppCompatActivity() {
         return classLabels.getOrNull(classId)?.takeIf { it.isNotBlank() } ?: "Object_$classId"
     }
 
+    /** YOLOX 학습과 동일: 비율 유지 리사이즈 + 114 패딩(letterbox). 반환: (letterbox 비트맵, scale r) */
+    private fun letterboxBitmap(bitmap: Bitmap, inputSize: Int): Pair<Bitmap, Float> {
+        val r = min(
+            inputSize.toFloat() / bitmap.width,
+            inputSize.toFloat() / bitmap.height
+        )
+        val newW = (bitmap.width * r).toInt().coerceAtLeast(1)
+        val newH = (bitmap.height * r).toInt().coerceAtLeast(1)
+        val scaled = Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+        val out = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawColor(Color.rgb(114, 114, 114))
+        canvas.drawBitmap(scaled, 0f, 0f, null)
+        if (scaled != bitmap) scaled.recycle()
+        return out to r
+    }
+
     /** YOLOX preproc: BGR, 0~255 float. NCHW [1,3,H,W] 시 채널 선 출력 */
     private fun bitmapToFloatBuffer(bitmap: Bitmap, size: Int, isNchw: Boolean = false): ByteBuffer {
         val buffer = ByteBuffer.allocateDirect(4 * size * size * 3)
@@ -995,8 +1014,9 @@ class MainActivity : AppCompatActivity() {
                 else -> inputShape.last()
             }
             val expectedBytes = 4 * inputSize * inputSize * 3
-            val preprocBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+            val (preprocBitmap, letterboxScale) = letterboxBitmap(bitmap, inputSize)
             val inputBuffer = bitmapToFloatBuffer(preprocBitmap, inputSize, isNchw)
+            if (preprocBitmap != bitmap) preprocBitmap.recycle()
             if (inputBuffer.remaining() != expectedBytes) {
                 Log.e(TAG, "YOLOX 입력 버퍼 크기 불일치: ${inputBuffer.remaining()} != $expectedBytes")
                 return emptyList()
@@ -1015,11 +1035,12 @@ class MainActivity : AppCompatActivity() {
                 outputShape[2],
                 bitmap.width,
                 bitmap.height,
-                inputSize
+                inputSize,
+                letterboxScaleR = letterboxScale
             )
             if (!firstInferenceLogged) {
                 firstInferenceLogged = true
-                Log.d(TAG, "YOLOX 첫 추론 | 입력 bitmap ${bitmap.width}x${bitmap.height} → resize ${inputSize}x${inputSize} | 추론 ${inferMs}ms")
+                Log.d(TAG, "YOLOX 첫 추론 | 입력 bitmap ${bitmap.width}x${bitmap.height} → letterbox ${inputSize}x${inputSize} scale=$letterboxScale | 추론 ${inferMs}ms")
             }
             val now = System.currentTimeMillis()
             if (now - lastYoloxDiagTimeMs >= 3000) {
@@ -1059,7 +1080,8 @@ class MainActivity : AppCompatActivity() {
         dim2: Int,
         imageWidth: Int,
         imageHeight: Int,
-        inputSize: Int
+        inputSize: Int,
+        letterboxScaleR: Float? = null
     ): List<OverlayView.DetectionBox> {
         val numBoxes: Int
         val boxSize: Int
@@ -1153,7 +1175,17 @@ class MainActivity : AppCompatActivity() {
                 right = (v2 * imageWidth).coerceIn(0f, imageWidth.toFloat())
                 bottom = (v3 * imageHeight).coerceIn(0f, imageHeight.toFloat())
             } else {
-                if (isNormalized) {
+                if (letterboxScaleR != null && letterboxScaleR > 0f) {
+                    // Letterbox: 모델 출력은 letterbox 캔버스 좌표 → 원본 이미지 좌표 = modelCoord / r
+                    val cx = (v0 / letterboxScaleR).coerceIn(0f, imageWidth.toFloat())
+                    val cy = (v1 / letterboxScaleR).coerceIn(0f, imageHeight.toFloat())
+                    val w = (v2 / letterboxScaleR) / 2f
+                    val h = (v3 / letterboxScaleR) / 2f
+                    left = max(0f, cx - w)
+                    top = max(0f, cy - h)
+                    right = min(imageWidth.toFloat(), cx + w)
+                    bottom = min(imageHeight.toFloat(), cy + h)
+                } else if (isNormalized) {
                     val cx = v0.coerceIn(0f, 1f) * imageWidth
                     val cy = v1.coerceIn(0f, 1f) * imageHeight
                     val w = (v2.coerceIn(0f, 1f) * imageWidth) / 2f
