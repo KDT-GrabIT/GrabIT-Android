@@ -129,6 +129,8 @@ class MainActivity : AppCompatActivity() {
     private var ttsGrabbedPlayed = false   // 객체 잡았음 TTS 1회만
     private var ttsAskAnotherPlayed = false
     private var waitingForYesNo = false    // 예/아니오 STT 대기 중
+    private var waitingForTouchConfirm = false  // "닿았나요?" 예/아니오 대기 (닿음 감지 후)
+    private var waitingForProductNameAfterYes = false  // "어떤 상품을 찾을까요?" 후 상품명 STT 대기
     private var handsOverlapFrameCount = 0  // 손-박스 겹침 연속 프레임 수 (잘못된 잡기 판정용)
     private var pinchGrabFrameCount = 0     // 엄지+검지 잡기 판정 연속 프레임
 
@@ -141,6 +143,23 @@ class MainActivity : AppCompatActivity() {
     /** LOCKED 시 마지막으로 YOLOX 검증 성공한 시각. 박스를 잃은 뒤 2초 지나면 추론을 매 프레임 켜서 재탐지 */
     private var lastSuccessfulValidationTimeMs = 0L
     private val REACQUIRE_INFERENCE_AFTER_MS = 2000L
+
+    // ---------- near-contact(touch) 판정 (시각장애인 UX, 현장 튜닝 포인트) ----------
+    /** 타겟 박스 확장 비율 (0.1~0.2). 확장된 박스 안에 엄지·검지 중간점이 있으면 touch */
+    private val TOUCH_BOX_EXPAND_RATIO = 0.15f
+    /** touch=true 연속 N프레임이면 touchActive 전환 + TTS 1회 */
+    private val TOUCH_CONFIRM_FRAMES = 6
+    /** touch=false 연속 N프레임이면 touchActive 해제 (즉시 해제 방지) */
+    private val RELEASE_HOLD_FRAMES = 10
+    /** TTS 재발화 쿨다운(ms). 이 시간 동안은 재트리거 금지 */
+    private val TOUCH_TTS_COOLDOWN_MS = 1800L
+
+    private var touchFrameCount = 0
+    private var releaseFrameCount = 0
+    private var touchActive = false
+    private var lastTouchTtsTimeMs = 0L
+    /** 디버그: 엄지·검지 중간점 (이미지 픽셀). OverlayView에 전달용 */
+    private var lastTouchMidpointPx: Pair<Float, Float>? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -217,14 +236,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun speak(text: String, onDone: (() -> Unit)? = null) {
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, null)
-        onDone?.let { cb ->
-            binding.root.postDelayed({ runOnUiThread(cb) }, (text.length * 80L).coerceIn(1500L, 4000L))
-        }
+        ttsManager?.speak(text, TextToSpeech.QUEUE_FLUSH, onDone)
     }
 
     private fun playWelcomeTTS() {
-        speak("그랩IT입니다. 원하시는 상품을 말씀해 주세요.")
+        speak("화면을 터치해서 상품찾기를 시작해주세요.")
     }
 
     private fun showFirstScreen() {
@@ -261,7 +277,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun onFirstScreenClicked() {
         if (screenState != ScreenState.FIRST_SCREEN) return
-        sttManager?.startListening()
+        // 화면 터치 시에만 마이크 켜고 상품명 입력 받기
+        voiceFlowController?.startProductNameInput()
     }
 
     private fun initSttTts() {
@@ -287,10 +304,13 @@ class MainActivity : AppCompatActivity() {
                         onStateChanged = { _, _ -> runOnUiThread { updateVoiceFlowButtonVisibility() } },
                         onSystemAnnounce = { msg -> runOnUiThread { binding.sttResultText.text = "🔊 $msg" } },
                         onRequestStartStt = { runOnUiThread { sttManager?.startListening() } },
-                        onStartSearch = { productName -> runOnUiThread { onStartSearchFromVoiceFlow(productName) } }
+                        onStartSearch = { productName -> runOnUiThread { onStartSearchFromVoiceFlow(productName) } },
+                        onProductNameEntered = { productName -> runOnUiThread { setTargetFromSpokenProductName(productName) } }
                     )
                     voiceFlowController?.start()
                     Log.d(TAG, "VoiceFlowController 시작")
+                    // 첫 화면일 때만 시작 안내 TTS (화면 터치해서 상품찾기 시작해주세요)
+                    if (screenState == ScreenState.FIRST_SCREEN) playWelcomeTTS()
                 } else {
                     Log.e(TAG, "TTS 초기화 실패")
                 }
@@ -303,6 +323,40 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     Log.d(TAG, "[STT 결과] $text")
                     binding.sttResultText.text = "🎤 $text"
+                    if (waitingForYesNo) {
+                        waitingForYesNo = false
+                        handleYesNoAfterGrab(text)
+                        return@runOnUiThread
+                    }
+                    if (waitingForTouchConfirm) {
+                        waitingForTouchConfirm = false
+                        handleTouchConfirmYesNo(text)
+                        return@runOnUiThread
+                    }
+                    if (waitingForProductNameAfterYes) {
+                        waitingForProductNameAfterYes = false
+                        binding.sttProgress.visibility = View.GONE
+                        if (text.isNotEmpty()) {
+                            val matchedLabel = mapSpokenToClass(text)
+                            if (matchedLabel == TARGET_ANY || matchedLabel.isBlank()) {
+                                speak("해당 상품은 목록에 없습니다. 찾을 수 있는 상품을 다시 말해주세요.") {
+                                    runOnUiThread { startSTTForProductName() }
+                                }
+                                return@runOnUiThread
+                            }
+                            currentTargetLabel.set(matchedLabel)
+                            val spinnerItems = listOf(TARGET_ANY) + classLabels
+                            val idx = spinnerItems.indexOf(matchedLabel)
+                            if (idx >= 0) binding.targetSpinner.setSelection(idx)
+                            binding.statusText.text = "찾는 중: ${getTargetLabel()}"
+                            val speakName = if (ProductDictionary.isLoaded()) ProductDictionary.getDisplayNameKo(matchedLabel) else matchedLabel
+                            speak("$speakName 찾겠습니다.") { transitionToSearching() }
+                        } else {
+                            Toast.makeText(this@MainActivity, "다시 말해주세요.", Toast.LENGTH_SHORT).show()
+                            transitionToSearching()
+                        }
+                        return@runOnUiThread
+                    }
                     voiceFlowController?.onSttResult(text)
                 }
             },
@@ -310,7 +364,21 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     Log.e(TAG, "[STT 에러] $msg")
                     binding.sttResultText.text = "❌ $msg"
-                    Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+                    if (waitingForTouchConfirm) {
+                        waitingForTouchConfirm = false
+                        binding.statusText.text = "손을 뻗어 잡아주세요"
+                        touchActive = false
+                        startPositionAnnounce()
+                        Toast.makeText(this, "음성 인식 실패. 다시 시도해주세요.", Toast.LENGTH_SHORT).show()
+                    } else if (waitingForProductNameAfterYes) {
+                        waitingForProductNameAfterYes = false
+                        binding.sttProgress.visibility = View.GONE
+                        binding.statusText.text = "찾는 중: ${getTargetLabel()}"
+                        Toast.makeText(this, "음성 인식 실패. 다시 시도해주세요.", Toast.LENGTH_SHORT).show()
+                        transitionToSearching()
+                    } else {
+                        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+                    }
                 }
             },
             onListeningChanged = { listening ->
@@ -359,18 +427,28 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 음성 플로우에서 확인 클릭 시: 카메라 켜고 실제 탐지 시작 */
+    /** 음성 플로우에서 확인 클릭 시: 첫 화면 숨기고 카메라 켠 뒤 탐지 시작. 입력된 상품만 탐지하도록 타겟을 반드시 특정 클래스로 설정. */
     private fun onStartSearchFromVoiceFlow(productName: String) {
-        cancelSearchTimeout()
         val targetClass = mapSpokenToClass(productName)
+        if (productName.isNotBlank() && (targetClass == TARGET_ANY || targetClass.isBlank())) {
+            speak("해당 상품은 목록에 없습니다. 찾을 수 있는 상품을 말해주세요.")
+            return
+        }
+        cancelSearchTimeout()
         voiceSearchTargetLabel = targetClass
         currentTargetLabel.set(targetClass)
-        binding.targetSpinner.setSelection(
-            (listOf(TARGET_ANY) + classLabels).indexOf(targetClass).coerceAtLeast(0)
-        )
+        val spinnerItems = listOf(TARGET_ANY) + classLabels
+        val idx = spinnerItems.indexOf(targetClass)
+        if (idx >= 0) {
+            binding.targetSpinner.setSelection(idx)
+        }
         binding.startSearchBtn.visibility = View.GONE
-        binding.previewView.visibility = View.VISIBLE
+        screenState = ScreenState.CAMERA_SCREEN
+        binding.firstScreen.visibility = View.GONE
+        binding.cameraContainer.visibility = View.VISIBLE
+        binding.btnFirstScreen.visibility = View.VISIBLE
         binding.overlayView.visibility = View.VISIBLE
+        binding.statusText.text = "찾는 중: ${getTargetLabel()}"
         startCamera()
         startSearchTimeout()
     }
@@ -386,10 +464,98 @@ class MainActivity : AppCompatActivity() {
         return TARGET_ANY
     }
 
+    /** 상품명 말한 직후 타겟을 해당 상품으로 설정. 목록에 없는 상품이면 타겟을 바꾸지 않음(모든 상품 모드로 넘어가지 않도록). */
+    private fun setTargetFromSpokenProductName(productName: String) {
+        val targetClass = mapSpokenToClass(productName)
+        if (productName.isNotBlank() && (targetClass == TARGET_ANY || targetClass.isBlank())) {
+            return
+        }
+        currentTargetLabel.set(targetClass)
+        val spinnerItems = listOf(TARGET_ANY) + classLabels
+        val idx = spinnerItems.indexOf(targetClass)
+        if (idx >= 0) {
+            binding.targetSpinner.setSelection(idx)
+        }
+    }
+
     private fun stopCamera() {
         try {
             ProcessCameraProvider.getInstance(this).get().unbindAll()
         } catch (_: Exception) {}
+    }
+
+    /** "다른 물건을 찾으시겠습니까?" 이후 예/아니오 STT 시작 */
+    private fun startSTTForYesNo() {
+        sttManager?.startListening()
+    }
+
+    /** "닿았나요?" 예/아니오 처리. 예 → "다른 물건 찾으시겠습니까?" 플로우, 아니오 → 알겠습니다 후 위치 안내 재개 */
+    private fun handleTouchConfirmYesNo(text: String) {
+        val t = text.trim().lowercase().replace(" ", "")
+        val isNo = t.contains("아니") || t.contains("틀렸") || t == "no" || t == "n"
+        if (isNo) {
+            speak("알겠습니다.") {
+                runOnUiThread {
+                    touchActive = false
+                    binding.statusText.text = "손을 뻗어 잡아주세요"
+                    startPositionAnnounce()
+                }
+            }
+        } else if (t.contains("예") || t.contains("네") || t.contains("응") || t.contains("어")) {
+            speak("다른 물건을 찾으시겠습니까?") {
+                runOnUiThread {
+                    waitingForYesNo = true
+                    startSTTForYesNo()
+                }
+            }
+        } else {
+            speak("예 또는 아니오로 답해주세요. 닿았나요?") {
+                runOnUiThread {
+                    waitingForTouchConfirm = true
+                    sttManager?.startListening()
+                }
+            }
+        }
+    }
+
+    /** 잡기 후 "다른 물건을 찾으시겠습니까?"에 대한 예/아니오 처리. 예 → 어떤 상품 찾을지 물어보고 STT */
+    private fun handleYesNoAfterGrab(text: String) {
+        val t = text.trim().lowercase().replace(" ", "")
+        val isNo = t.contains("아니") || t.contains("틀렸") || t.contains("다른") || t == "no" || t == "n"
+        if (isNo) {
+            speak("알겠습니다.") {
+                runOnUiThread {
+                    transitionToSearching()
+                    stopCamera()
+                    showFirstScreen()
+                    playWelcomeTTS()
+                }
+            }
+        } else if (t.contains("예") || t.contains("네") || t.contains("응") || t.contains("어")) {
+            speak("어떤 상품을 찾을까요?") {
+                runOnUiThread { startSTTForProductName() }
+            }
+        } else {
+            speak("예 또는 아니오로 답해주세요. 다른 물건을 찾으시겠습니까?") {
+                runOnUiThread {
+                    waitingForYesNo = true
+                    startSTTForYesNo()
+                }
+            }
+        }
+    }
+
+    /** "어떤 상품을 찾을까요?" 이후 상품명 STT → 타겟 설정 후 탐색 (sttManager 사용) */
+    private fun startSTTForProductName() {
+        if (sttManager == null) {
+            Toast.makeText(this, "음성 인식을 사용할 수 없습니다.", Toast.LENGTH_SHORT).show()
+            transitionToSearching()
+            return
+        }
+        binding.sttProgress.visibility = View.VISIBLE
+        binding.statusText.text = "찾을 상품을 말해주세요"
+        waitingForProductNameAfterYes = true
+        sttManager?.startListening()
     }
 
     private fun startSearchTimeout() {
@@ -416,6 +582,10 @@ class MainActivity : AppCompatActivity() {
         stopPositionAnnounce()
         positionAnnounceRunnable = object : Runnable {
             override fun run() {
+                if (waitingForTouchConfirm || waitingForYesNo) {
+                    searchTimeoutHandler.postDelayed(this, POSITION_ANNOUNCE_INTERVAL_MS)
+                    return
+                }
                 val box = frozenBox ?: return
                 val w = frozenImageWidth
                 val h = frozenImageHeight
@@ -508,7 +678,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun getTargetLabel(): String = currentTargetLabel.get()
+    private fun getTargetLabel(): String = currentTargetLabel.get().trim()
+
+    /** 음성으로 특정 상품을 말한 경우만 true. "모든 상품"이거나 비어 있으면 false. */
+    private fun isSpecificTarget(): Boolean {
+        val t = getTargetLabel()
+        return t.isNotEmpty() && t != TARGET_ANY
+    }
 
     /** LOCKED 시 시각 보정: 이전 박스와 IoU가 가장 큰 타겟 detection 반환. 없으면 null
      * @param minConfidence occlusion 시 더 낮은 기준 사용 (예: 0.15f) */
@@ -606,8 +782,13 @@ class MainActivity : AppCompatActivity() {
             ttsGrabPlayed = false
             ttsGrabbedPlayed = false
             ttsAskAnotherPlayed = false
+            waitingForTouchConfirm = false
             handsOverlapFrameCount = 0
             pinchGrabFrameCount = 0
+            touchFrameCount = 0
+            releaseFrameCount = 0
+            touchActive = false
+            lastTouchMidpointPx = null
             binding.resetBtn.visibility = View.GONE
             binding.overlayView.setDetections(listOf(box), imageWidth, imageHeight)
             binding.overlayView.setFrozen(true)
@@ -646,8 +827,13 @@ class MainActivity : AppCompatActivity() {
             ttsGrabPlayed = false
             ttsGrabbedPlayed = false
             ttsAskAnotherPlayed = false
+            waitingForTouchConfirm = false
             handsOverlapFrameCount = 0
             pinchGrabFrameCount = 0
+            touchFrameCount = 0
+            releaseFrameCount = 0
+            touchActive = false
+            lastTouchMidpointPx = null
             opticalFlowTracker.reset()
             gyroManager.stopTracking()
             binding.resetBtn.visibility = View.GONE
@@ -876,28 +1062,50 @@ class MainActivity : AppCompatActivity() {
                         isHandOverlappingBox(latestHandsResult.get(), box.rect, w, h)
                     } ?: false
 
-                    val pinchGrab = frozenBox?.let { box ->
-                        isPinchGrab(latestHandsResult.get(), box.rect, w, h)
+                    // near-contact(touch) 판정: 엄지·검지 중간점이 확장 박스 안에 있으면 true
+                    val handTouch = frozenBox?.let { box ->
+                        isHandTouchingTargetBox(latestHandsResult.get(), box.rect, w, h)
                     } ?: false
 
-                    if (pinchGrab) {
-                        pinchGrabFrameCount++
-                        if (pinchGrabFrameCount >= 5 && !ttsGrabbedPlayed && !waitingForYesNo) {
-                            ttsGrabbedPlayed = true
-                            ttsAskAnotherPlayed = true
-                            runOnUiThread {
-                                stopHandGuidanceTTS()
-                                binding.statusText.text = "다른 물건을 찾으시겠습니까?"
-                                speak("객체를 잡았습니다. 다른 물건을 찾으시겠습니까?") {
-                                    runOnUiThread {
-                                        waitingForYesNo = true
-                                        startSTTForYesNo()
+                    // 상태머신: 연속 프레임 확인 + 해제 홀드 + 쿨다운
+                    if (handTouch) {
+                        touchFrameCount++
+                        releaseFrameCount = 0
+                        if (!touchActive && touchFrameCount >= TOUCH_CONFIRM_FRAMES) {
+                            touchActive = true
+                            val nowMs = System.currentTimeMillis()
+                            if (nowMs - lastTouchTtsTimeMs >= TOUCH_TTS_COOLDOWN_MS) {
+                                lastTouchTtsTimeMs = nowMs
+                                runOnUiThread {
+                                    stopPositionAnnounce()
+                                    stopHandGuidanceTTS()
+                                    binding.statusText.text = "닿았나요?"
+                                    speak("손이 제품에 닿았어요. 닿았나요?") {
+                                        runOnUiThread {
+                                            waitingForTouchConfirm = true
+                                            sttManager?.startListening()
+                                        }
                                     }
                                 }
+                                Log.d(TAG, "[touch] touchActive=true, TTS 발화 (cooldown ${TOUCH_TTS_COOLDOWN_MS}ms)")
                             }
                         }
                     } else {
-                        pinchGrabFrameCount = 0
+                        releaseFrameCount++
+                        if (releaseFrameCount >= RELEASE_HOLD_FRAMES) {
+                            touchActive = false
+                            touchFrameCount = 0
+                            Log.d(TAG, "[touch] touchActive=false (releaseHold ${RELEASE_HOLD_FRAMES} frames)")
+                        } else {
+                            touchFrameCount = 0
+                        }
+                    }
+                    // 개발용: 카운터/상태 변화 시에만 로그 (프레임 스팸 방지)
+                    if (handTouch && touchFrameCount == TOUCH_CONFIRM_FRAMES) {
+                        Log.d(TAG, "[touch] touchFrameCount=$touchFrameCount -> confirm")
+                    }
+                    if (!handTouch && releaseFrameCount == RELEASE_HOLD_FRAMES) {
+                        Log.d(TAG, "[touch] releaseFrameCount=$releaseFrameCount -> release")
                     }
 
                     gyroManager.suspendUpdates = handsOverlap
@@ -1272,6 +1480,58 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * near-contact(닿음) 판정: 엄지·검지 중간점이 확장된 타겟 박스 안에 있으면 true.
+     * 시각장애인 UX용 — "손이 제품에 닿았거나 충분히 가까울 때" 안내.
+     * 좌표는 기존 landmarkToPoint(정규화 → 이미지 픽셀) 유지.
+     */
+    private fun isHandTouchingTargetBox(
+        handsResult: HandLandmarkerResult?,
+        targetBox: RectF,
+        imageWidth: Int,
+        imageHeight: Int
+    ): Boolean {
+        val landmarks = handsResult?.landmarks() ?: run {
+            lastTouchMidpointPx = null
+            return false
+        }
+        if (imageWidth <= 0 || imageHeight <= 0) {
+            lastTouchMidpointPx = null
+            return false
+        }
+        val hand = landmarks.firstOrNull() ?: run {
+            lastTouchMidpointPx = null
+            return false
+        }
+        if (hand.size < 9) {
+            lastTouchMidpointPx = null
+            return false
+        }
+        val thumb = landmarkToPoint(hand, THUMB_TIP, imageWidth, imageHeight) ?: run {
+            lastTouchMidpointPx = null
+            return false
+        }
+        val index = landmarkToPoint(hand, INDEX_TIP, imageWidth, imageHeight) ?: run {
+            lastTouchMidpointPx = null
+            return false
+        }
+        val midX = (thumb.first + index.first) / 2f
+        val midY = (thumb.second + index.second) / 2f
+        lastTouchMidpointPx = Pair(midX, midY)
+
+        val w = targetBox.width().coerceAtLeast(1f)
+        val h = targetBox.height().coerceAtLeast(1f)
+        val expandW = w * TOUCH_BOX_EXPAND_RATIO
+        val expandH = h * TOUCH_BOX_EXPAND_RATIO
+        val touchBox = RectF(
+            targetBox.left - expandW,
+            targetBox.top - expandH,
+            targetBox.right + expandW,
+            targetBox.bottom + expandH
+        )
+        return touchBox.contains(midX, midY)
+    }
+
     /** 랜드마크를 이미지 좌표 (x,y) 로 변환 */
     private
     fun landmarkToPoint(hand: List<NormalizedLandmark>, index: Int, imageWidth: Int, imageHeight: Int): Pair<Float, Float>? {
@@ -1284,11 +1544,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 잡기 판정: 엄지와 검지 끝이 **객체(박스)를 실제로 터치·잡은** 경우만 true.
-     * - 엄지 끝(4), 검지 끝(8)이 박스 위 또는 박스 가장자리 근처(터치 허용 마진) 안에 있어야 함.
-     * - "손만 나오면" 잡기 X → 반드시 엄지·검지가 객체 영역을 터치한 상태여야 함.
-     * - 나머지 손가락(중지·약지·소지) 중 2개 이상이 박스 밖이면 잡는 자세로 추가 인정.
+     * [미사용] 기존 pinch 잡기 판정. near-contact(isHandTouchingTargetBox)으로 대체됨.
+     * 참고용으로 유지.
      */
+    @Suppress("unused")
     private fun isPinchGrab(handsResult: HandLandmarkerResult?, boxRect: RectF, imageWidth: Int, imageHeight: Int): Boolean {
         val landmarks = handsResult?.landmarks() ?: return false
         if (imageWidth <= 0 || imageHeight <= 0) return false
@@ -1406,13 +1665,22 @@ class MainActivity : AppCompatActivity() {
             binding.overlayView.setHands(
                 if (searchState == SearchState.LOCKED) latestHandsResult.get() else null
             )
+            if (searchState == SearchState.LOCKED && lastTouchMidpointPx != null) {
+                binding.overlayView.setTouchDebugPoint(lastTouchMidpointPx!!.first, lastTouchMidpointPx!!.second)
+            } else {
+                binding.overlayView.setTouchDebugPoint(null, null)
+            }
 
             if (!waitingForYesNo) {
                 when (searchState) {
                     SearchState.SEARCHING -> binding.statusText.text = "찾는 중: ${getTargetLabel()}"
                     SearchState.LOCKED -> {
-                        if (frozenBox != null && !ttsGrabbedPlayed) {
-                            binding.statusText.text = "손을 뻗어 잡아주세요"
+                        if (frozenBox != null) {
+                            binding.statusText.text = when {
+                                waitingForTouchConfirm -> "닿았나요?"
+                                touchActive -> "손이 제품에 닿았어요"
+                                else -> "손을 뻗어 잡아주세요"
+                            }
                         }
                     }
                 }

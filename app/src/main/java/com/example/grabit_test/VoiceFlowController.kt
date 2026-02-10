@@ -14,7 +14,8 @@ class VoiceFlowController(
     private val onStateChanged: (VoiceFlowState, String) -> Unit,
     private val onSystemAnnounce: (String) -> Unit = {},
     private val onRequestStartStt: () -> Unit,
-    private val onStartSearch: (productName: String) -> Unit
+    private val onStartSearch: (productName: String) -> Unit,
+    private val onProductNameEntered: (productName: String) -> Unit = {}
 ) {
     companion object {
         private const val TAG = "VoiceFlowController"
@@ -30,7 +31,7 @@ class VoiceFlowController(
             "'다시'라고 말씀하시면 마지막 안내를 다시 들으실 수 있습니다."
 
         fun msgConfirmProduct(productName: String) =
-            "찾으시는 상품이 ${productName} 맞습니까?"
+            "찾으시는 상품이 ${productName} 맞습니까? 아니라면 상품이름을 다시 말해주세요."
 
         fun msgSearching(productName: String) = "${productName}을 찾고 있습니다. 잠시만 기다려주세요."
 
@@ -58,17 +59,17 @@ class VoiceFlowController(
     private var lastSpokenText: String = ""
     private var currentProductName: String = ""
 
-    /** 앱 시작 시 호출: 처음 안내 → 삐 → 찾으시는 상품을 말씀해주세요 → 삐 → STT 시작 */
+    /** 앱 시작 시 호출: 상태만 APP_START로 두고, STT는 시작하지 않음 (화면 터치 후 startProductNameInput 호출) */
     fun start() {
         transitionTo(VoiceFlowState.APP_START)
-        speak(MSG_APP_START) {
+    }
+
+    /** 화면 터치 후 호출: 찾으시는 상품을 말씀해주세요 → 삐 → STT 시작 */
+    fun startProductNameInput() {
+        transitionTo(VoiceFlowState.WAITING_PRODUCT_NAME)
+        speak(MSG_ASK_PRODUCT) {
             beepPlayer.playBeep {
-                speak(MSG_ASK_PRODUCT) {
-                    beepPlayer.playBeep {
-                        transitionTo(VoiceFlowState.WAITING_PRODUCT_NAME)
-                        onRequestStartStt()
-                    }
-                }
+                onRequestStartStt()
             }
         }
     }
@@ -105,6 +106,7 @@ class VoiceFlowController(
             else -> {
                 currentProductName = text
                 transitionTo(VoiceFlowState.CONFIRM_PRODUCT)
+                onProductNameEntered(currentProductName)
                 val msg = msgConfirmProduct(currentProductName)
                 speak(msg) {
                     beepPlayer.playBeep {
@@ -233,16 +235,16 @@ class VoiceFlowController(
     }
 
     /**
-     * 화면 기준 상품 위치 → 가로 방향만 안내 (640x480~1024x720 저해상도에서는 박스 크기 기반 거리 추정 불가)
+     * 사용자 기준 방향만 짧게 안내 (5초마다 재생)
      */
     private fun buildPositionGuidance(box: RectF, w: Int, h: Int): String {
         val centerX = (box.left + box.right) / 2f / w
         return when {
-            centerX < 0.3f -> "화면 왼쪽에 있습니다. 왼쪽으로 이동하세요."
-            centerX < 0.45f -> "화면 중앙 왼쪽에 있습니다. 왼쪽으로 조금 이동하세요."
-            centerX < 0.55f -> "화면 중앙에 있습니다."
-            centerX < 0.7f -> "화면 중앙 오른쪽에 있습니다. 오른쪽으로 조금 이동하세요."
-            else -> "화면 오른쪽에 있습니다. 오른쪽으로 이동하세요."
+            centerX < 0.3f -> "왼쪽."
+            centerX < 0.45f -> "조금 왼쪽."
+            centerX < 0.55f -> "정면."
+            centerX < 0.7f -> "조금 오른쪽."
+            else -> "오른쪽."
         }
     }
 

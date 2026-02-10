@@ -44,7 +44,7 @@
                     android:layout_gravity="center"
                     android:gravity="center"
                     android:padding="32dp"
-                    android:text="화면을 터치한 후\n찾고 싶은 물건을 말해주세요"
+                    android:text="화면을 터치해서 상품찾기를 시작해주세요"
                     android:textColor="#FFFFFF"
                     android:textSize="22sp"
                     android:lineSpacingExtra="8dp" />
