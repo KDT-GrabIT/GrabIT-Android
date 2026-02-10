@@ -1,9 +1,14 @@
 package com.example.grabitTest
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
 import android.util.Log
 import android.view.View
 import android.widget.AdapterView
@@ -39,6 +44,7 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 class MainActivity : AppCompatActivity() {
 
@@ -109,6 +115,31 @@ class MainActivity : AppCompatActivity() {
     )
     private val REQUEST_CODE_PERMISSIONS = 10
 
+    // 화면 상태
+    enum class ScreenState { FIRST_SCREEN, CAMERA_SCREEN }
+    private var screenState = ScreenState.FIRST_SCREEN
+
+    // TTS / STT
+    private var tts: TextToSpeech? = null
+    private var speechRecognizer: SpeechRecognizer? = null
+    private var ttsDetectedPlayed = false   // 객체 탐지 TTS 1회만
+    private var ttsGrabPlayed = false      // 손 뻗어 잡으세요 TTS (LOCKED 후)
+    private var ttsGrabbedPlayed = false   // 객체 잡았음 TTS 1회만
+    private var ttsAskAnotherPlayed = false
+    private var waitingForYesNo = false    // 예/아니오 STT 대기 중
+    private var handsOverlapFrameCount = 0  // 손-박스 겹침 연속 프레임 수 (잘못된 잡기 판정용)
+    private var pinchGrabFrameCount = 0     // 엄지+검지 잡기 판정 연속 프레임
+
+    // 손 위치 안내 TTS (손을 더 뻗어주세요 등)
+    private val handGuidanceHandler = Handler(Looper.getMainLooper())
+    private var handGuidanceRunnable: Runnable? = null
+    private var lastHandGuidanceTimeMs = 0L
+    private val HAND_GUIDANCE_INTERVAL_MS = 5000L
+
+    /** LOCKED 시 마지막으로 YOLOX 검증 성공한 시각. 박스를 잃은 뒤 2초 지나면 추론을 매 프레임 켜서 재탐지 */
+    private var lastSuccessfulValidationTimeMs = 0L
+    private val REACQUIRE_INFERENCE_AFTER_MS = 2000L
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -124,28 +155,111 @@ class MainActivity : AppCompatActivity() {
         initGyroTrackingManager()
         initSttTts()
 
-        binding.startSearchBtn.setOnClickListener { onStartSearchClicked() }
+        binding.firstScreen.setOnClickListener { onFirstScreenClicked() }
         binding.resetBtn.setOnClickListener { gyroManager.resetToSearchingFromUI() }
+        binding.btnFirstScreen.setOnClickListener { goToFirstScreen() }
+        setupProductDrawer()
         binding.micButton.setOnClickListener { onMicButtonClicked() }
         binding.confirmBtn.setOnClickListener { voiceFlowController?.onConfirmClicked() }
         binding.reinputBtn.setOnClickListener { voiceFlowController?.onReinputClicked() }
         binding.retryBtn.setOnClickListener { voiceFlowController?.onRetrySearch() }
 
         if (allPermissionsGranted()) {
-            binding.startSearchBtn.visibility = View.VISIBLE
+            showFirstScreen()
+            // TTS는 initTTS 콜백에서 준비되면 playWelcomeTTS() 호출 (중복 호출 방지)
         } else {
-            binding.startSearchBtn.visibility = View.GONE
             ActivityCompat.requestPermissions(
                 this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
             )
         }
     }
 
-    private fun onStartSearchClicked() {
-        binding.startSearchBtn.visibility = View.GONE
-        binding.previewView.visibility = View.VISIBLE
+    private fun initTTS() {
+        tts = TextToSpeech(this) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                tts?.language = java.util.Locale.KOREAN
+                runOnUiThread {
+                    if (allPermissionsGranted()) playWelcomeTTS()
+                }
+            }
+        }
+    }
+
+    private fun initSTT() {
+        if (SpeechRecognizer.isRecognitionAvailable(this)) {
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+        }
+    }
+
+    /** 햄버거 메뉴 - 찾을 수 있는 품목 리스트 Drawer */
+    private fun setupProductDrawer() {
+        val productList = listOf(TARGET_ANY) + classLabels
+        binding.productListView.adapter = ArrayAdapter(this, R.layout.item_product, R.id.itemProductName, productList)
+        binding.productListView.setOnItemClickListener { _, _, position, _ ->
+            val label = productList.getOrNull(position) ?: return@setOnItemClickListener
+            currentTargetLabel.set(label)
+            binding.drawerLayout.closeDrawers()
+            if (screenState == ScreenState.FIRST_SCREEN) {
+                val displayName = if (ProductDictionary.isLoaded()) ProductDictionary.getDisplayNameKo(label) else label
+                speak("$displayName 찾겠습니다.") {
+                    runOnUiThread { showCameraScreen() }
+                }
+            } else {
+                binding.statusText.text = "찾는 중: $label"
+                transitionToSearching()
+            }
+        }
+        binding.menuButton.setOnClickListener {
+            binding.drawerLayout.openDrawer(binding.drawerContent)
+        }
+    }
+
+    private fun speak(text: String, onDone: (() -> Unit)? = null) {
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, null)
+        onDone?.let { cb ->
+            binding.root.postDelayed({ runOnUiThread(cb) }, (text.length * 80L).coerceIn(1500L, 4000L))
+        }
+    }
+
+    private fun playWelcomeTTS() {
+        speak("그랩IT입니다. 원하시는 상품을 말씀해 주세요.")
+    }
+
+    private fun showFirstScreen() {
+        screenState = ScreenState.FIRST_SCREEN
+        binding.firstScreen.visibility = View.VISIBLE
+        binding.cameraContainer.visibility = View.GONE
+        binding.btnFirstScreen.visibility = View.GONE
+        binding.targetRow.visibility = View.GONE
+        binding.statusText.text = ""
+        stopHandGuidanceTTS()
+    }
+
+    /** 우측 하단 '첫 화면' 버튼: 카메라 끄고 첫 화면으로 */
+    private fun goToFirstScreen() {
+        transitionToSearching()
+        stopCamera()
+        speak("첫 화면으로 돌아갑니다.") {
+            runOnUiThread {
+                showFirstScreen()
+                playWelcomeTTS()
+            }
+        }
+    }
+
+    private fun showCameraScreen() {
+        screenState = ScreenState.CAMERA_SCREEN
+        binding.firstScreen.visibility = View.GONE
+        binding.cameraContainer.visibility = View.VISIBLE
+        binding.btnFirstScreen.visibility = View.VISIBLE
         binding.overlayView.visibility = View.VISIBLE
+        binding.statusText.text = "찾는 중: ${getTargetLabel()}"
         startCamera()
+    }
+
+    private fun onFirstScreenClicked() {
+        if (screenState != ScreenState.FIRST_SCREEN) return
+        sttManager?.startListening()
     }
 
     private fun initSttTts() {
@@ -268,6 +382,12 @@ class MainActivity : AppCompatActivity() {
             if (labelNorm.contains(s) || s.contains(labelNorm.take(3))) return label
         }
         return TARGET_ANY
+    }
+
+    private fun stopCamera() {
+        try {
+            ProcessCameraProvider.getInstance(this).get().unbindAll()
+        } catch (_: Exception) {}
     }
 
     private fun startSearchTimeout() {
@@ -481,9 +601,19 @@ class MainActivity : AppCompatActivity() {
             validationFailCount = 0
             frozenImageWidth = imageWidth
             frozenImageHeight = imageHeight
-            binding.resetBtn.visibility = View.VISIBLE
+            ttsGrabPlayed = false
+            ttsGrabbedPlayed = false
+            ttsAskAnotherPlayed = false
+            handsOverlapFrameCount = 0
+            pinchGrabFrameCount = 0
+            binding.resetBtn.visibility = View.GONE
             binding.overlayView.setDetections(listOf(box), imageWidth, imageHeight)
             binding.overlayView.setFrozen(true)
+            binding.statusText.text = "객체 탐지됨. 손을 뻗어 잡아주세요."
+            if (!ttsDetectedPlayed) {
+                ttsDetectedPlayed = true
+                speak("객체를 탐지했습니다. 손을 뻗어 잡아주세요.")
+            }
             binding.yoloxStatus.text = "🔒 고정: ${box.label} (자이로)"
             binding.handsStatus.text = "📐 자이로: ON"
             Toast.makeText(this, "타겟 고정 → 자이로 추적 모드", Toast.LENGTH_SHORT).show()
@@ -510,13 +640,19 @@ class MainActivity : AppCompatActivity() {
             pendingLockCount = 0
             validationFailCount = 0
             wasOccluded = false
+            ttsDetectedPlayed = false
+            ttsGrabPlayed = false
+            ttsGrabbedPlayed = false
+            ttsAskAnotherPlayed = false
+            handsOverlapFrameCount = 0
+            pinchGrabFrameCount = 0
             opticalFlowTracker.reset()
             gyroManager.stopTracking()
             binding.resetBtn.visibility = View.GONE
             binding.overlayView.setDetections(emptyList(), 0, 0)
             binding.overlayView.setFrozen(false)
-            binding.yoloxStatus.text = "🔍 탐색 중..."
-            binding.handsStatus.text = "📐 자이로: OFF"
+            binding.statusText.text = "찾는 중: ${getTargetLabel()}"
+            stopHandGuidanceTTS()
         }
     }
 
@@ -575,12 +711,12 @@ class MainActivity : AppCompatActivity() {
                 options.addDelegate(gpuDelegate)
                 options.setAllowFp16PrecisionForFp32(true)
                 Log.d(TAG, "🚀 GPU 가속 켜짐 (FP16)")
-                runOnUiThread { binding.yoloxStatus.text = "📦 YOLOX: GPU (FP16)" }
+                runOnUiThread { binding.statusText.text = "YOLOX GPU 준비" }
             } catch (e: Exception) {
                 Log.e(TAG, "❌ GPU 실패 -> CPU 전환", e)
                 options.setNumThreads(4)
                 gpuDelegate = null
-                runOnUiThread { binding.yoloxStatus.text = "📦 YOLOX: CPU" }
+                runOnUiThread { binding.statusText.text = "YOLOX CPU 준비" }
             }
             yoloxInterpreter = Interpreter(modelFile, options)
             val inputShape = yoloxInterpreter!!.getInputTensor(0).shape()
@@ -588,7 +724,7 @@ class MainActivity : AppCompatActivity() {
             Log.d(TAG, "YOLOX 로드 | $modelFilename | 입력 ${inputSize}x${inputSize}")
         } catch (e: Exception) {
             Log.e(TAG, "YOLOX 초기화 실패", e)
-            runOnUiThread { binding.yoloxStatus.text = "Error: Init Failed" }
+            runOnUiThread { binding.statusText.text = "YOLOX 초기화 실패" }
         }
     }
 
@@ -710,27 +846,66 @@ class MainActivity : AppCompatActivity() {
                     displayResults(filterDetectionsByTarget(detections, getTargetLabel()), inferenceTime, w, h)
                 }
                 SearchState.LOCKED -> {
-                    // YOLOX: N프레임마다 검증 + 시각 보정 (자이로 드리프트 보정)
                     lockedFrameCount++
-                    val shouldValidate = (lockedFrameCount % VALIDATION_INTERVAL) == 0
+                    val nowMs = System.currentTimeMillis()
+                    val boxLostDurationMs = nowMs - lastSuccessfulValidationTimeMs
+                    val shouldReacquire = boxLostDurationMs >= REACQUIRE_INFERENCE_AFTER_MS
+                    val shouldValidate = shouldReacquire || (lockedFrameCount % VALIDATION_INTERVAL) == 0
                     var inferMs = System.currentTimeMillis() - startTime
 
                     val handsOverlap = frozenBox?.let { box ->
                         isHandOverlappingBox(latestHandsResult.get(), box.rect, w, h)
                     } ?: false
 
+                    val pinchGrab = frozenBox?.let { box ->
+                        isPinchGrab(latestHandsResult.get(), box.rect, w, h)
+                    } ?: false
+
+                    if (pinchGrab) {
+                        pinchGrabFrameCount++
+                        if (pinchGrabFrameCount >= 5 && !ttsGrabbedPlayed && !waitingForYesNo) {
+                            ttsGrabbedPlayed = true
+                            ttsAskAnotherPlayed = true
+                            runOnUiThread {
+                                stopHandGuidanceTTS()
+                                binding.statusText.text = "다른 물건을 찾으시겠습니까?"
+                                speak("객체를 잡았습니다. 다른 물건을 찾으시겠습니까?") {
+                                    runOnUiThread {
+                                        waitingForYesNo = true
+                                        startSTTForYesNo()
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        pinchGrabFrameCount = 0
+                    }
+
                     gyroManager.suspendUpdates = handsOverlap
 
                     if (handsOverlap) {
-                        // occlusion: optical flow로 화면 이동량 추적 → 박스도 동일 이동
-                        val handRect = mergedHandRect(latestHandsResult.get(), w, h)
-                        val flow = opticalFlowTracker.update(bitmap, handRect, frozenBox?.rect)
-                        flow?.let { (dx, dy) ->
-                            val box = frozenBox ?: return@let
-                            val r = box.rect
-                            val newRect = RectF(r.left + dx, r.top + dy, r.right + dx, r.bottom + dy)
-                            gyroManager.correctPosition(newRect)
-                            frozenBox = box.copy(rect = newRect)
+                        if (shouldReacquire) {
+                            val detections = runYOLOX(bitmap)
+                            inferMs = System.currentTimeMillis() - startTime
+                            val minConf = 0.18f
+                            val tracked = findTrackedTarget(detections, lockedTargetLabel, frozenBox, minConf)
+                            if (tracked != null) {
+                                lastSuccessfulValidationTimeMs = System.currentTimeMillis()
+                                gyroManager.correctPosition(tracked.rect)
+                                frozenBox = tracked.copy(rotationDegrees = 0f)
+                                frozenImageWidth = w
+                                frozenImageHeight = h
+                            }
+                        } else {
+                            val handRect = mergedHandRect(latestHandsResult.get(), w, h)
+                            val flow = opticalFlowTracker.update(bitmap, handRect, frozenBox?.rect)
+                            flow?.let { (dx, dy) ->
+                                val box = frozenBox ?: return@let
+                                val r = box.rect
+                                val newRect = RectF(r.left + dx, r.top + dy, r.right + dx, r.bottom + dy)
+                                gyroManager.correctPosition(newRect)
+                                frozenBox = box.copy(rect = newRect)
+                            }
                         }
                     } else {
                         // occlusion 해제 → gyro 기저 동기화
@@ -740,11 +915,12 @@ class MainActivity : AppCompatActivity() {
                         if (shouldValidate) {
                             val detections = runYOLOX(bitmap)
                             inferMs = System.currentTimeMillis() - startTime
-                            val minConf = TARGET_CONFIDENCE_THRESHOLD * 0.5f
+                            val minConf = if (shouldReacquire) 0.18f else 0.22f
                             val tracked = findTrackedTarget(detections, lockedTargetLabel, frozenBox, minConf)
                             if (tracked != null) {
                                 validationFailCount = 0
                                 // 한 프레임 점프 방지: 현재 박스 70% + YOLOX 30% 블렌딩
+                                lastSuccessfulValidationTimeMs = System.currentTimeMillis()
                                 val cur = frozenBox?.rect ?: tracked.rect
                                 val blend = 0.7f
                                 val blendedRect = RectF(
@@ -1054,7 +1230,7 @@ class MainActivity : AppCompatActivity() {
         return union
     }
 
-    /** 손이 박스와 겹치면 true (occlusion) */
+    /** 손이 박스와 겹치면 true (occlusion, optical flow용) */
     private fun isHandOverlappingBox(handsResult: HandLandmarkerResult?, boxRect: RectF, imageWidth: Int, imageHeight: Int): Boolean {
         val landmarks = handsResult?.landmarks() ?: return false
         if (imageWidth <= 0 || imageHeight <= 0) return false
@@ -1062,6 +1238,104 @@ class MainActivity : AppCompatActivity() {
             val handRect = handLandmarksToRect(hand, imageWidth, imageHeight)
             iou(handRect, boxRect) > 0.1f
         }
+    }
+
+    /** 랜드마크를 이미지 좌표 (x,y) 로 변환 */
+    private
+    fun landmarkToPoint(hand: List<NormalizedLandmark>, index: Int, imageWidth: Int, imageHeight: Int): Pair<Float, Float>? {
+        if (index < 0 || index >= hand.size) return null
+        val lm = hand[index]
+        return Pair(
+            lm.x().coerceIn(0f, 1f) * imageWidth,
+            lm.y().coerceIn(0f, 1f) * imageHeight
+        )
+    }
+
+    /**
+     * 잡기 판정: 엄지와 검지 끝이 **객체(박스)를 실제로 터치·잡은** 경우만 true.
+     * - 엄지 끝(4), 검지 끝(8)이 박스 위 또는 박스 가장자리 근처(터치 허용 마진) 안에 있어야 함.
+     * - "손만 나오면" 잡기 X → 반드시 엄지·검지가 객체 영역을 터치한 상태여야 함.
+     * - 나머지 손가락(중지·약지·소지) 중 2개 이상이 박스 밖이면 잡는 자세로 추가 인정.
+     */
+    private fun isPinchGrab(handsResult: HandLandmarkerResult?, boxRect: RectF, imageWidth: Int, imageHeight: Int): Boolean {
+        val landmarks = handsResult?.landmarks() ?: return false
+        if (imageWidth <= 0 || imageHeight <= 0) return false
+        val boxW = max(boxRect.width(), 20f)
+        val boxH = max(boxRect.height(), 20f)
+        val touchMargin = max(boxW, boxH) * 0.02f
+        val touchBox = RectF(
+            boxRect.left - touchMargin,
+            boxRect.top - touchMargin,
+            boxRect.right + touchMargin,
+            boxRect.bottom + touchMargin
+        )
+        for (hand in landmarks) {
+            if (hand.size < 21) continue
+            val thumb = landmarkToPoint(hand, THUMB_TIP, imageWidth, imageHeight) ?: continue
+            val index = landmarkToPoint(hand, INDEX_TIP, imageWidth, imageHeight) ?: continue
+            val thumbOnObject = touchBox.contains(thumb.first, thumb.second)
+            val indexOnObject = touchBox.contains(index.first, index.second)
+            if (!thumbOnObject || !indexOnObject) continue
+
+            val middle = landmarkToPoint(hand, MIDDLE_TIP, imageWidth, imageHeight)
+            val ring = landmarkToPoint(hand, RING_TIP, imageWidth, imageHeight)
+            val pinky = landmarkToPoint(hand, PINKY_TIP, imageWidth, imageHeight)
+            val middleBehind = middle != null && !boxRect.contains(middle.first, middle.second)
+            val ringBehind = ring != null && !boxRect.contains(ring.first, ring.second)
+            val pinkyBehind = pinky != null && !boxRect.contains(pinky.first, pinky.second)
+            val behindCount = listOf(middleBehind, ringBehind, pinkyBehind).count { it }
+            if (behindCount >= 2) return true
+        }
+        return false
+    }
+
+    /** LOCKED 상태에서 손 위치에 따른 TTS 안내 문구 (손을 더 뻗어주세요, 앞으로 움직여주세요 등) */
+    private fun buildHandPositionGuidance(handsResult: HandLandmarkerResult?, boxRect: RectF, imageWidth: Int, imageHeight: Int): String? {
+        val landmarks = handsResult?.landmarks() ?: return null
+        if (landmarks.isEmpty() || imageWidth <= 0 || imageHeight <= 0) return null
+        val hand = landmarks.first()
+        if (hand.size <= WRIST) return null
+        val wrist = landmarkToPoint(hand, WRIST, imageWidth, imageHeight) ?: return null
+        val boxCenterX = (boxRect.left + boxRect.right) / 2f
+        val boxCenterY = (boxRect.top + boxRect.bottom) / 2f
+        val dx = (wrist.first - boxCenterX) / imageWidth
+        val dy = (wrist.second - boxCenterY) / imageHeight
+        val dist = sqrt(dx * dx + dy * dy)
+
+        return when {
+            dist > 0.45f -> "손을 더 뻗어주세요. 앞으로 조금 더 움직여주세요."
+            dist > 0.3f -> "조금 더 앞으로 다가가 주세요."
+            dx > 0.15f -> "오른쪽으로 조금 움직여주세요."
+            dx < -0.15f -> "왼쪽으로 조금 움직여주세요."
+            dy > 0.12f -> "아래로 조금 움직여주세요."
+            dy < -0.12f -> "위로 조금 움직여주세요."
+            else -> null
+        }
+    }
+
+    private fun startHandGuidanceTTS() {
+        stopHandGuidanceTTS()
+        handGuidanceRunnable = object : Runnable {
+            override fun run() {
+                if (searchState != SearchState.LOCKED || ttsGrabbedPlayed || waitingForYesNo) return
+                val box = frozenBox ?: return
+                val w = frozenImageWidth
+                val h = frozenImageHeight
+                if (w <= 0 || h <= 0) return
+                val guidance = buildHandPositionGuidance(latestHandsResult.get(), box.rect, w, h)
+                if (!guidance.isNullOrBlank()) {
+                    lastHandGuidanceTimeMs = System.currentTimeMillis()
+                    speak(guidance)
+                }
+                handGuidanceHandler.postDelayed(this, HAND_GUIDANCE_INTERVAL_MS)
+            }
+        }
+        handGuidanceHandler.postDelayed(handGuidanceRunnable!!, HAND_GUIDANCE_INTERVAL_MS)
+    }
+
+    private fun stopHandGuidanceTTS() {
+        handGuidanceRunnable?.let { handGuidanceHandler.removeCallbacks(it) }
+        handGuidanceRunnable = null
     }
 
     /** LIVE_STREAM: 프레임만 넘기고 즉시 return. 결과는 resultListener 콜백으로 옴. */
@@ -1101,21 +1375,16 @@ class MainActivity : AppCompatActivity() {
                 if (searchState == SearchState.LOCKED) latestHandsResult.get() else null
             )
 
-            when (searchState) {
-                SearchState.SEARCHING -> {
-                    binding.yoloxStatus.text = "🔍 탐색: ${getTargetLabel()} (${detections.size}개 감지)"
-                    binding.handsStatus.text = "📐 자이로: OFF"
-                }
-                SearchState.LOCKED -> {
-                    val box = frozenBox
-                    if (box != null) {
-                        binding.yoloxStatus.text = "🔒 고정: ${box.label} (자이로)"
+            if (!waitingForYesNo) {
+                when (searchState) {
+                    SearchState.SEARCHING -> binding.statusText.text = "찾는 중: ${getTargetLabel()}"
+                    SearchState.LOCKED -> {
+                        if (frozenBox != null && !ttsGrabbedPlayed) {
+                            binding.statusText.text = "손을 뻗어 잡아주세요"
+                        }
                     }
-                    binding.handsStatus.text = "📐 자이로: ON"
                 }
             }
-
-            binding.inferenceTime.text = "⏱️ Inference: ${inferenceTime}ms"
         }
     }
 
@@ -1123,10 +1392,6 @@ class MainActivity : AppCompatActivity() {
         frameCount++
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastFpsTime >= 1000) {
-            val fps = frameCount * 1000 / (currentTime - lastFpsTime)
-            runOnUiThread {
-                binding.fpsText.text = "FPS: $fps"
-            }
             frameCount = 0
             lastFpsTime = currentTime
         }
@@ -1144,7 +1409,8 @@ class MainActivity : AppCompatActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_CODE_PERMISSIONS) {
             if (allPermissionsGranted()) {
-                binding.startSearchBtn.visibility = View.VISIBLE
+                showFirstScreen()
+                playWelcomeTTS()
             } else {
                 Toast.makeText(this, "카메라 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
                 finish()
@@ -1170,5 +1436,11 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "GrabIT_Test"
         private var yoloxShapeLogged = false
+        private const val THUMB_TIP = 4
+        private const val INDEX_TIP = 8
+        private const val MIDDLE_TIP = 12
+        private const val RING_TIP = 16
+        private const val PINKY_TIP = 20
+        private const val WRIST = 0
     }
 }

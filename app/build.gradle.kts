@@ -54,16 +54,21 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+    implementation("androidx.drawerlayout:drawerlayout:1.2.0")
 
+    // 1. MediaPipe 0.10.26 (16KB 지원)
     implementation("com.google.mediapipe:tasks-vision:0.10.26")
+
+    // 2. CameraX 1.4.1
     implementation("androidx.camera:camera-camera2:1.4.1")
     implementation("androidx.camera:camera-lifecycle:1.4.1")
     implementation("androidx.camera:camera-view:1.4.1")
 
+    // 3. LiteRT (16KB 지원)
     implementation("com.google.ai.edge.litert:litert:1.4.1")
     implementation("com.google.ai.edge.litert:litert-gpu:1.4.1")
     implementation("com.google.ai.edge.litert:litert-support:1.4.1")
 
-    // OpenCV 4.12.0: 16KB 페이지 크기 호환 (4.9.0 → 4.12.0)
+    // 4. OpenCV 4.12.0 (16KB 페이지 호환, 4.9.0은 미지원)
     implementation("org.opencv:opencv:4.12.0")
 }

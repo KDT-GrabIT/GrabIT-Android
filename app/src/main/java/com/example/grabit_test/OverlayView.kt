@@ -97,8 +97,7 @@ class OverlayView @JvmOverloads constructor(
         val scaleX = if (imageWidth > 0) width.toFloat() / imageWidth else 1f
         val scaleY = if (imageHeight > 0) height.toFloat() / imageHeight else 1f
 
-        // 1. YOLOX 박스 그리기 (width가 0일 때 coerceIn 범위 오류 방지)
-        val maxX = (width - 100f).coerceAtLeast(0f)
+        // 1. YOLOX 박스만 그리기 (객체 이름 표시 없음)
         val paint = if (isFrozen) lockedBoxPaint else boxPaint
         detectionBoxes.forEachIndexed { index, box ->
             val r = box.rect
@@ -113,49 +112,10 @@ class OverlayView @JvmOverloads constructor(
             canvas.save()
             if (kotlin.math.abs(rot) > 0.5f) canvas.rotate(rot, cx, cy)
             canvas.drawRect(left, top, right, bottom, paint)
-            val lineH = textPaint.textSize + 4f
-            var labelY = (top - 10f).coerceAtLeast(10f)
-            val labelsToShow = if (box.topLabels.isNotEmpty()) box.topLabels
-                else if (box.confidence >= 0.5f) listOf(box.label to (box.confidence * 100).toInt())
-                else emptyList()
-            labelsToShow.forEach { (name, pct) ->
-                canvas.drawText("$name $pct%", left.coerceIn(0f, maxX), labelY, textPaint)
-                labelY += lineH
-            }
             canvas.restore()
         }
 
-        // 2. 하단: 감지 개수 + 상세 (클래스 | 신뢰도 | 좌표 L,T,R,B) 한 줄씩
-        val lineH = coordTextPaint.textSize + 6f
-        val maxDetailLines = 12
-        val blockLines = 3 + minOf(detectionBoxes.size, maxDetailLines)
-        val blockTop = (height - lineH * blockLines).coerceAtLeast(0f)
-        val pad = 16f
-        canvas.drawRect(0f, blockTop, width.toFloat(), height.toFloat(), coordBgPaint)
-        var y = blockTop + lineH
-        canvas.drawText("YOLOX 감지: ${detectionBoxes.size}개", pad, y, coordTextPaint)
-        y += lineH
-        canvas.drawText("상세 (클래스 | 신뢰도 | L,T,R,B 픽셀):", pad, y, coordTextPaint)
-        y += lineH
-        detectionBoxes.take(maxDetailLines).forEachIndexed { idx, box ->
-            val r = box.rect
-            val labelsStr = if (box.topLabels.isNotEmpty())
-                box.topLabels.joinToString(" | ") { "${it.first} ${it.second}%" }
-            else if (box.confidence >= 0.5f) "${box.label} ${(box.confidence * 100).toInt()}%"
-            else "(50% 미만)"
-            canvas.drawText(
-                "${idx + 1}) $labelsStr | L=${r.left.toInt()} T=${r.top.toInt()} R=${r.right.toInt()} B=${r.bottom.toInt()}",
-                pad,
-                y,
-                coordTextPaint
-            )
-            y += lineH
-        }
-        if (detectionBoxes.isEmpty()) {
-            canvas.drawText("(없음)", pad, y, coordTextPaint)
-        }
-
-        // 2. MediaPipe Hands 그리기 (정규화 좌표 → 뷰 좌표, 세로 화면에 맞게 보정)
+        // MediaPipe Hands 그리기 (정규화 좌표 → 뷰 좌표, 세로 화면에 맞게 보정)
         handLandmarks.forEach { hand ->
             hand.forEach { landmark ->
                 val (px, py) = handLandmarkToView(landmark.x(), landmark.y())
