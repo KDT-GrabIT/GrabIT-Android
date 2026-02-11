@@ -144,10 +144,10 @@ class MainActivity : AppCompatActivity() {
     private var touchConfirmInProgress = false
 
     // ---------- near-contact(touch) 판정 (시각장애인 UX, 현장 튜닝 포인트) ----------
-    /** 타겟 박스 확장 비율 (0.1~0.2). 확장된 박스 안에 엄지·검지 중간점이 있으면 touch */
-    private val TOUCH_BOX_EXPAND_RATIO = 0.15f
-    /** touch=true 연속 N프레임이면 touchActive 전환 + TTS 1회 */
-    private val TOUCH_CONFIRM_FRAMES = 6
+    /** 타겟 박스 확장 비율. 확장된 박스 안에 엄지·검지 중간점이 있으면 touch (넓을수록 잡기 판정 수월) */
+    private val TOUCH_BOX_EXPAND_RATIO = 0.22f
+    /** touch=true 연속 N프레임이면 touchActive 전환 + TTS 1회 (낮을수록 빨리 잡았다고 인정) */
+    private val TOUCH_CONFIRM_FRAMES = 4
     /** touch=false 연속 N프레임이면 touchActive 해제 (즉시 해제 방지) */
     private val RELEASE_HOLD_FRAMES = 10
     /** TTS 재발화 쿨다운(ms). 이 시간 동안은 재트리거 금지 */
