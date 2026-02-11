@@ -312,12 +312,8 @@ class MainActivity : AppCompatActivity() {
                         onSystemAnnounce = { msg -> runOnUiThread { binding.sttResultText.text = "🔊 $msg" } },
                         onRequestStartStt = {
                     runOnUiThread {
-                        // 음성 안내 직후 '삐 소리가 나면 말씀해주세요'가 빨리 나오도록 짧은 대기만
-                        Log.d("STT", "MainActivity: onRequestStartStt() → startListening after 150ms (voice flow)")
-                        binding.root.postDelayed({
-                            Log.d("STT", "MainActivity: onRequestStartStt() delayed → startListening()")
-                            sttManager?.startListening()
-                        }, 150L)
+                        Log.d("STT", "MainActivity: onRequestStartStt() → startListening() (0ms)")
+                        sttManager?.startListening()
                     }
                 },
                         onStartSearch = { productName -> runOnUiThread { onStartSearchFromVoiceFlow(productName) } },
