@@ -10,7 +10,6 @@ import android.util.Log
  */
 class VoiceFlowController(
     private val ttsManager: TTSManager,
-    private val beepPlayer: BeepPlayer,
     private val onStateChanged: (VoiceFlowState, String) -> Unit,
     private val onSystemAnnounce: (String) -> Unit = {},
     private val onRequestStartStt: () -> Unit,
@@ -64,13 +63,11 @@ class VoiceFlowController(
         transitionTo(VoiceFlowState.APP_START)
     }
 
-    /** 화면 터치 후 호출: 찾으시는 상품을 말씀해주세요 → 삐 → STT 시작 */
+    /** 화면 터치 후 호출: 찾으시는 상품을 말씀해주세요 → STT 시작 (STT에서 "삐 소리가 나면 말씀해주세요" + 삐 재생) */
     fun startProductNameInput() {
         transitionTo(VoiceFlowState.WAITING_PRODUCT_NAME)
         speak(MSG_ASK_PRODUCT) {
-            beepPlayer.playBeep {
-                onRequestStartStt()
-            }
+            onRequestStartStt()
         }
     }
 
@@ -109,10 +106,8 @@ class VoiceFlowController(
                 onProductNameEntered(currentProductName)
                 val msg = msgConfirmProduct(currentProductName)
                 speak(msg) {
-                    beepPlayer.playBeep {
-                        transitionTo(VoiceFlowState.WAITING_CONFIRMATION)
-                        onRequestStartStt()
-                    }
+                    transitionTo(VoiceFlowState.WAITING_CONFIRMATION)
+                    onRequestStartStt()
                 }
             }
         }
@@ -190,17 +185,13 @@ class VoiceFlowController(
                 currentProductName = ""
                 transitionTo(VoiceFlowState.WAITING_PRODUCT_NAME)
                 speak(MSG_ASK_PRODUCT) {
-                    beepPlayer.playBeep {
-                        onRequestStartStt()
-                    }
+                    onRequestStartStt()
                 }
             }
             VoiceFlowState.SEARCH_FAILED -> {
                 transitionTo(VoiceFlowState.WAITING_PRODUCT_NAME)
                 speak(MSG_ASK_PRODUCT) {
-                    beepPlayer.playBeep {
-                        onRequestStartStt()
-                    }
+                    onRequestStartStt()
                 }
             }
             else -> {}
@@ -257,9 +248,7 @@ class VoiceFlowController(
         if (currentState != VoiceFlowState.SEARCH_FAILED && currentState != VoiceFlowState.SEARCH_RESULT) return
         transitionTo(VoiceFlowState.WAITING_PRODUCT_NAME)
         speak(MSG_ASK_PRODUCT) {
-            beepPlayer.playBeep {
-                onRequestStartStt()
-            }
+            onRequestStartStt()
         }
     }
 

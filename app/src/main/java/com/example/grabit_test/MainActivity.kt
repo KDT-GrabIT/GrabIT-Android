@@ -308,17 +308,16 @@ class MainActivity : AppCompatActivity() {
                 if (success && beepPlayer != null) {
                     voiceFlowController = VoiceFlowController(
                         ttsManager = ttsManager!!,
-                        beepPlayer = beepPlayer!!,
                         onStateChanged = { _, _ -> runOnUiThread { updateVoiceFlowButtonVisibility() } },
                         onSystemAnnounce = { msg -> runOnUiThread { binding.sttResultText.text = "🔊 $msg" } },
                         onRequestStartStt = {
                     runOnUiThread {
-                        // 삐 소리 후 오디오 정착 시간 확보 (마이크 미작동/인식 실패 방지)
-                        Log.d("STT", "MainActivity: onRequestStartStt() → will call startListening after 350ms (voice flow)")
+                        // 음성 안내 직후 '삐 소리가 나면 말씀해주세요'가 빨리 나오도록 짧은 대기만
+                        Log.d("STT", "MainActivity: onRequestStartStt() → startListening after 150ms (voice flow)")
                         binding.root.postDelayed({
                             Log.d("STT", "MainActivity: onRequestStartStt() delayed → startListening()")
                             sttManager?.startListening()
-                        }, 350L)
+                        }, 150L)
                     }
                 },
                         onStartSearch = { productName -> runOnUiThread { onStartSearchFromVoiceFlow(productName) } },
@@ -406,6 +405,10 @@ class MainActivity : AppCompatActivity() {
                     if (listening) binding.sttResultText.text = "🎤 듣는 중..."
                     updateVoiceFlowButtonVisibility()
                 }
+            },
+            beepPlayer = beepPlayer,
+            speakPrompt = { prompt, onDone ->
+                ttsManager?.speak(prompt, TextToSpeech.QUEUE_FLUSH, onDone) ?: onDone()
             }
         ).also { if (it.init()) Log.d(TAG, "STT 초기화 완료") }
     }
