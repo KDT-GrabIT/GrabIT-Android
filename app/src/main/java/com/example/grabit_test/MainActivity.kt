@@ -186,6 +186,7 @@ class MainActivity : AppCompatActivity() {
         initGyroTrackingManager()
         initSttTts()
 
+        binding.firstScreen.setOnClickListener { onFirstScreenClicked() }
         binding.resetBtn.setOnClickListener { gyroManager.resetToSearchingFromUI() }
         binding.btnFirstScreen.setOnClickListener { goToFirstScreen() }
         setupProductDrawer()
