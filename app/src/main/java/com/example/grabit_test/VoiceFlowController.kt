@@ -142,8 +142,9 @@ class VoiceFlowController(
 
     private fun isConfirmationYes(text: String): Boolean {
         val t = text.trim().lowercase().replace(" ", "")
-        return t.contains("예") || t.contains("네") || t.contains("맞") || t.contains("응") ||
-            t == "yes" || t == "y" || t.contains("그래") || t.contains("좋아")
+        return t.contains("예") || t.contains("네") || t.contains("내") || t.contains("맞") || t.contains("응") ||
+            t == "yes" || t == "y" || t.contains("그래") || t.contains("좋아") ||
+            t == "네" || t == "내" || t == "예"
     }
 
     private fun isConfirmationNo(text: String): Boolean {
