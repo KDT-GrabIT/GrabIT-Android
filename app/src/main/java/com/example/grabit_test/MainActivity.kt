@@ -6,8 +6,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color
 import android.os.Bundle
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -15,19 +13,29 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.util.Log
 import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewGroup
+import android.app.AlertDialog
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.*
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import android.graphics.RectF
+import android.util.Size
 import com.example.grabitTest.databinding.ActivityMainBinding
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
@@ -63,6 +71,25 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var cameraExecutor: ExecutorService
+    private var camera: Camera? = null
+
+    // 능동형 자동 줌 (기존)
+    private var isAutoZooming = false
+    private var lastZoomTime = 0L
+    private val ZOOM_COOLDOWN_MS = 2000L
+    private val ZOOM_RESET_DELAY_MS = 1500L
+    private val SUSPECTED_CONF_MIN = 0.3f
+    private val SUSPECTED_CONF_MAX = 0.5f
+    private val SMALL_BOX_AREA_RATIO = 0.05f
+    private val zoomResetHandler = Handler(Looper.getMainLooper())
+    private var zoomResetRunnable: Runnable? = null
+    @Volatile private var currentZoomRatio = 1f
+
+    // 자동 탐색(Auto-Scan) 모드: 1.0x ↔ 2.5x 반복 (시각장애인용)
+    private val scanHandler = Handler(Looper.getMainLooper())
+    private var isScanning = false
+    private var isZoomedIn = false
+    private val SCAN_INTERVAL_MS = 1500L
 
     // AI 모델
     private var yoloxInterpreter: Interpreter? = null
@@ -115,6 +142,7 @@ class MainActivity : AppCompatActivity() {
     private var voiceFlowController: VoiceFlowController? = null
     private val searchTimeoutHandler = Handler(Looper.getMainLooper())
     private var searchTimeoutRunnable: Runnable? = null
+    @Volatile private var searchTimeoutAborted = false
     private val SEARCH_TIMEOUT_MS = 30_000L
     private val POSITION_ANNOUNCE_INTERVAL_MS = 5000L
     private var positionAnnounceRunnable: Runnable? = null
@@ -229,6 +257,8 @@ class MainActivity : AppCompatActivity() {
         binding.confirmBtn.setOnClickListener { voiceFlowController?.onConfirmClicked() }
         binding.reinputBtn.setOnClickListener { voiceFlowController?.onReinputClicked() }
         binding.retryBtn.setOnClickListener { voiceFlowController?.onRetrySearch() }
+        binding.adminTextInputBtn.setOnClickListener { showAdminTextInputDialog() }
+        setupPinchZoom()
 
         if (allPermissionsGranted()) {
             showFirstScreen()
@@ -701,9 +731,91 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopCamera() {
+        stopScanning()
+        cancelZoomReset()
         try {
             ProcessCameraProvider.getInstance(this).get().unbindAll()
+            camera = null
         } catch (_: Exception) {}
+    }
+
+    private fun setupPinchZoom() {
+        val detector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                val cam = camera ?: return false
+                val newZoom = (currentZoomRatio * detector.scaleFactor).coerceIn(1f, 10f)
+                currentZoomRatio = newZoom
+                cam.cameraControl.setZoomRatio(newZoom)
+                return true
+            }
+        })
+        binding.previewView.setOnTouchListener { _, event ->
+            detector.onTouchEvent(event)
+            false
+        }
+    }
+
+    private fun cancelZoomReset() {
+        zoomResetRunnable?.let { zoomResetHandler.removeCallbacks(it) }
+        zoomResetRunnable = null
+    }
+
+    private var scanRunnable: Runnable? = null
+
+    /** 자동 탐색 시작: SEARCHING 상태에서 1.5초마다 1.0x ↔ 2.5x 전환 */
+    private fun startScanning() {
+        if (isScanning) return
+        if (screenState != ScreenState.CAMERA_SCREEN) return
+        if (searchState != SearchState.SEARCHING) return
+        if (!hasSpecificTarget()) return
+        if (camera == null) return
+        isScanning = true
+        isZoomedIn = false
+        scanRunnable = object : Runnable {
+            override fun run() {
+                if (!isScanning || searchState != SearchState.SEARCHING) return
+                val c = camera ?: run { isScanning = false; return }
+                isZoomedIn = !isZoomedIn
+                val ratio = if (isZoomedIn) 2.5f else 1.0f
+                c.cameraControl.setZoomRatio(ratio)
+                currentZoomRatio = ratio
+                scanHandler.postDelayed(this, SCAN_INTERVAL_MS)
+            }
+        }
+        scanHandler.postDelayed(scanRunnable!!, SCAN_INTERVAL_MS)
+    }
+
+    /** 자동 탐색 중단 (물체 발견 시 또는 LOCKED 진입 시) */
+    private fun stopScanning() {
+        isScanning = false
+        scanRunnable?.let { scanHandler.removeCallbacks(it) }
+        scanRunnable = null
+    }
+
+    /** 관리자: 클래스 드롭다운으로 선택 후 바로 찾기 과정 진행 */
+    private fun showAdminTextInputDialog() {
+        if (classLabels.isEmpty()) {
+            Toast.makeText(this, "클래스 목록을 불러오는 중입니다.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val spinner = android.widget.Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, classLabels)
+            setPadding(32, 24, 32, 24)
+        }
+        val container = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(48, 32, 48, 24)
+            addView(spinner)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("클래스 선택")
+            .setView(container)
+            .setPositiveButton("확인") { _, _ ->
+                val selected = spinner.selectedItem?.toString()?.trim() ?: ""
+                if (selected.isNotBlank()) onStartSearchFromVoiceFlow(selected)
+            }
+            .setNegativeButton("취소", null)
+            .show()
     }
 
     /** [예 말하기 공통] 부분 인식에서 "예" 등 짧은 긍정 판별. 1. 찾는 상품 확인, 2. 객체 잡았나요 — 둘 다 이 함수 사용. 항상 동시 적용. */
@@ -763,9 +875,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun startSearchTimeout() {
         cancelSearchTimeout()
+        searchTimeoutAborted = false
         searchTimeoutRunnable = Runnable {
+            if (searchTimeoutAborted) return@Runnable
+            if (searchState == SearchState.LOCKED) return@Runnable
             if (voiceFlowController?.currentState == VoiceFlowController.VoiceFlowState.SEARCHING_PRODUCT) {
                 runOnUiThread {
+                    if (searchTimeoutAborted || searchState == SearchState.LOCKED) return@runOnUiThread
                     voiceSearchTargetLabel = null
                     voiceFlowController?.onSearchComplete(false)
                     binding.previewView.visibility = View.GONE
@@ -777,6 +893,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun cancelSearchTimeout() {
+        searchTimeoutAborted = true
         searchTimeoutRunnable?.let { searchTimeoutHandler.removeCallbacks(it) }
         searchTimeoutRunnable = null
     }
@@ -897,7 +1014,21 @@ class MainActivity : AppCompatActivity() {
     /** 특정 상품이 선택된 경우만 true. 비어 있으면 탐지 시작 안 함. */
     private fun hasSpecificTarget(): Boolean = getTargetLabel().isNotEmpty()
 
-    /** LOCKED 시 시각 보정: 이전 박스와 IoU가 가장 큰 타겟 detection 반환. 없으면 null
+    /** 물체 발견 시 자동 탐색 중단 (현재 줌 유지). Auto-Scan 모드가 1.0x↔2.5x 토글을 담당. */
+    private fun processAutoZoom(detections: List<OverlayView.DetectionBox>, imageWidth: Int, imageHeight: Int) {
+        val target = getTargetLabel().trim()
+        if (target.isBlank()) return
+
+        val confident = detections.any { d ->
+            (d.label.equals(target, true) || d.topLabels.any { it.first.equals(target, true) }) &&
+                d.confidence >= TARGET_CONFIDENCE_THRESHOLD
+        }
+        if (confident) {
+            stopScanning()
+        }
+    }
+
+    /** LOCKED 시 시각 보정: 자이로 예측 위치 또는 이전 박스와 가장 가까운 타겟 반환 (Gyro-Guided Matching)
      * @param minConfidence occlusion 시 더 낮은 기준 사용 (예: 0.15f) */
     private fun findTrackedTarget(
         detections: List<OverlayView.DetectionBox>,
@@ -921,10 +1052,17 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (candidates.isEmpty()) return null
-        return if (prevBox != null) {
-            candidates.maxByOrNull { iou(it.rect, prevBox.rect) }
-        } else {
-            candidates.maxByOrNull { it.confidence }
+        val predicted = gyroManager.getPredictedRect()
+        return when {
+            predicted != null -> candidates.minByOrNull { box ->
+                val cx = (box.rect.left + box.rect.right) / 2f
+                val cy = (box.rect.top + box.rect.bottom) / 2f
+                val px = (predicted.left + predicted.right) / 2f
+                val py = (predicted.top + predicted.bottom) / 2f
+                (cx - px) * (cx - px) + (cy - py) * (cy - py)
+            }
+            prevBox != null -> candidates.maxByOrNull { iou(it.rect, prevBox.rect) }
+            else -> candidates.maxByOrNull { it.confidence }
         }
     }
 
@@ -976,9 +1114,10 @@ class MainActivity : AppCompatActivity() {
 
     /** @param actualPrimaryLabel 탐지된 1순위 라벨(음성 플로우에서 요청 상품과 비교용). null이면 box.label 사용 */
     private fun transitionToLocked(box: OverlayView.DetectionBox, imageWidth: Int, imageHeight: Int, actualPrimaryLabel: String? = null) {
+        cancelSearchTimeout()
         runOnUiThread {
-            // 이미 LOCKED면 재진입 방지 (여러 프레임이 runOnUiThread로 쌓여 TTS/토스트 반복 재생되는 것 방지)
             if (searchState == SearchState.LOCKED) return@runOnUiThread
+            stopScanning()
             searchState = SearchState.LOCKED
             lockedTargetLabel = box.label
             validationFailCount = 0
@@ -1057,6 +1196,7 @@ class MainActivity : AppCompatActivity() {
             binding.systemMessageText.text = "찾는 중: ${getTargetLabel()}"
             binding.statusText.text = "찾는 중: ${getTargetLabel()}"
             stopHandGuidanceTTS()
+            if (screenState == ScreenState.CAMERA_SCREEN) startScanning()
         }
     }
 
@@ -1080,22 +1220,9 @@ class MainActivity : AppCompatActivity() {
         return classLabels.getOrNull(classId)?.takeIf { it.isNotBlank() } ?: "Object_$classId"
     }
 
-    /** YOLOX 학습과 동일: 비율 유지 리사이즈 + 114 패딩(letterbox). 반환: (letterbox 비트맵, scale r) */
-    private fun letterboxBitmap(bitmap: Bitmap, inputSize: Int): Pair<Bitmap, Float> {
-        val r = min(
-            inputSize.toFloat() / bitmap.width,
-            inputSize.toFloat() / bitmap.height
-        )
-        val newW = (bitmap.width * r).toInt().coerceAtLeast(1)
-        val newH = (bitmap.height * r).toInt().coerceAtLeast(1)
-        val scaled = Bitmap.createScaledBitmap(bitmap, newW, newH, true)
-        val out = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(out)
-        canvas.drawColor(Color.rgb(114, 114, 114))
-        canvas.drawBitmap(scaled, 0f, 0f, null)
-        if (scaled != bitmap) scaled.recycle()
-        return out to r
-    }
+    /** YOLOX 입력: BitmapUtils Letterboxing 사용(비율 유지, 찌그러짐 없음) */
+    private fun letterboxBitmap(bitmap: Bitmap, inputSize: Int): Pair<Bitmap, Float> =
+        BitmapUtils.createLetterboxBitmap(bitmap, inputSize)
 
     /** YOLOX preproc: BGR, 0~255 float. NCHW [1,3,H,W] 시 채널 선 출력 */
     private fun bitmapToFloatBuffer(bitmap: Bitmap, size: Int, isNchw: Boolean = false): ByteBuffer {
@@ -1158,43 +1285,48 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startCamera() {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        val resolutionSelector = ResolutionSelector.Builder()
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    Size(1280, 720),
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                )
+            )
+            .build()
 
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
 
-            // Preview
             val preview = Preview.Builder()
+                .setResolutionSelector(resolutionSelector)
                 .build()
-                .also {
-                    it.setSurfaceProvider(binding.previewView.surfaceProvider)
-                }
+                .also { it.setSurfaceProvider(binding.previewView.surfaceProvider) }
 
-            // ImageAnalysis
             val imageAnalyzer = ImageAnalysis.Builder()
+                .setResolutionSelector(resolutionSelector)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()
-                .also {
-                    it.setAnalyzer(cameraExecutor, ImageAnalyzer())
-                }
+                .also { it.setAnalyzer(cameraExecutor, ImageAnalyzer()) }
 
-            // 카메라 선택
             val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
             try {
                 cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(
+                camera = cameraProvider.bindToLifecycle(
                     this, cameraSelector, preview, imageAnalyzer
                 )
+                currentZoomRatio = 1f
+                startScanning()
             } catch (e: Exception) {
                 Log.e(TAG, "카메라 바인딩 실패", e)
             }
-
         }, ContextCompat.getMainExecutor(this))
     }
 
     // YOLOX 진단 로그: 3초마다 한 번만 출력 (로그 과다 방지)
     private var firstInferenceLogged = false
+    private var firstResolutionLogged = false
     private var lastTargetMatchDiagMs = 0L
 
     // 이미지 분석기
@@ -1217,6 +1349,10 @@ class MainActivity : AppCompatActivity() {
 
             val w = bitmap.width
             val h = bitmap.height
+            if (!firstResolutionLogged) {
+                Log.d("GrabIT_CamRes_Only", "이미지 분석 해상도: ${w} x ${h}")
+                firstResolutionLogged = true
+            }
             val inferenceTime = System.currentTimeMillis() - startTime
 
             // 손 인식: LOCKED일 때만 실행 (occlusion/optical flow용). SEARCHING에서는 파이프라인 비활성화
@@ -1230,6 +1366,7 @@ class MainActivity : AppCompatActivity() {
                         displayResults(emptyList(), inferenceTime, w, h)
                     } else {
                     val detections = runYOLOX(bitmap)
+                    processAutoZoom(detections, w, h)
                     val matchResult = findTargetMatch(detections, getTargetLabel())
                     if (matchResult != null) {
                         val (matched, actualPrimaryLabel) = matchResult

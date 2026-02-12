@@ -325,6 +325,21 @@
                 app:layout_constraintStart_toStartOf="parent"
                 app:layout_constraintTop_toTopOf="parent" />
 
+            <!-- 관리자: 클래스 드롭다운으로 빠른 선택 (버튼 위치: 햄버거 아래) -->
+            <Button
+                android:id="@+id/adminTextInputBtn"
+                android:layout_width="32dp"
+                android:layout_height="32dp"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:textSize="11sp"
+                android:text="T"
+                android:contentDescription="관리자 선택"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintTop_toBottomOf="@id/menuButton"
+                android:layout_margin="8dp" />
+
             <!-- 우측 하단 첫 화면으로 돌아가기 버튼 (카메라 화면에서만 표시) -->
             <Button
                 android:id="@+id/btnFirstScreen"
