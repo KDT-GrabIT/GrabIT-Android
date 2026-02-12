@@ -1,0 +1,20 @@
+{
+  "answers": [
+    {
+      "keyword": "예",
+      "proximity_words": ["네", "응", "맞아", "맞아요", "그래", "좋아", "yes", "y"],
+      "type": "answer"
+    },
+    {
+      "keyword": "아니",
+      "proximity_words": ["아니요", "틀렸", "다른", "no", "n"],
+      "type": "answer"
+    }
+  ],
+  "products": [
+    { "class_id": "pocari_sweat_500ml", "display_name": "포카리 스웨트", "proximity_words": ["포카리", "포카리 스웨트"], "type": "product" },
+    { "class_id": "sprite_500ml", "display_name": "스프라이트", "proximity_words": ["스프라이트"], "type": "product" },
+    { "class_id": "milkis_500ml", "display_name": "밀키스", "proximity_words": ["밀키스"], "type": "product" },
+    { "class_id": "jeju_samdasoo_500ml", "display_name": "삼다수", "proximity_words": ["삼다수", "제주 삼다수"], "type": "product" }
+  ]
+}

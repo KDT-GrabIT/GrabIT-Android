@@ -125,6 +125,9 @@ class GyroTrackingManager(
         onTrackingLost()
     }
 
+    /** 자이로 센서로 예측된 현재 박스 위치 (Gyro-Guided Matching용). LOCKED가 아니면 null */
+    fun getPredictedRect(): RectF? = if (isLocked) RectF(currentSmoothedRect) else null
+
     override fun onSensorChanged(event: SensorEvent?) {
         if (!isLocked || event == null) return
 

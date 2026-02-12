@@ -13,6 +13,7 @@ const PORT = process.env.PORT || 3000;
 const DB_NAME = 'grabit';
 const COL_ANSWERS = 'answer_synonyms';
 const COL_PRODUCTS = 'product_synonyms';
+const E5_SERVICE_URL = process.env.E5_SERVICE_URL || 'http://localhost:5000';
 
 app.use(cors());
 app.use(express.json());
@@ -72,6 +73,50 @@ app.get('/synonyms/products', async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message, items: [] });
+  }
+});
+
+// (선택) e5 유사검색: GET /synonyms/search?q=검색어&top_k=5
+app.get('/synonyms/search', async (req, res) => {
+  const q = (req.query.q || '').trim();
+  const topK = Math.min(parseInt(req.query.top_k, 10) || 5, 50);
+  try {
+    const database = await getDb();
+    if (!database || !q) {
+      return res.json({ items: [] });
+    }
+    const col = database.collection(COL_PRODUCTS);
+    const products = await col.find({}).toArray();
+    if (products.length === 0) {
+      return res.json({ items: [] });
+    }
+    const candidates = products.map(p => [p.display_name, ...(p.proximity_words || [])].join(' '));
+    const response = await fetch(`${E5_SERVICE_URL.replace(/\/$/, '')}/search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: q, candidates, top_k: topK })
+    });
+    if (!response.ok) {
+      return res.json({ items: products.slice(0, topK) });
+    }
+    const body = await response.json();
+    const results = (body.results || []).map(r => r.text);
+    const byCandidate = new Map();
+    candidates.forEach((c, i) => byCandidate.set(c, products[i]));
+    const seen = new Set();
+    const sorted = results
+      .map(text => byCandidate.get(text))
+      .filter(p => p && !seen.has(p.class_id) && (seen.add(p.class_id) || true));
+    res.json({ items: sorted });
+  } catch (e) {
+    console.error('search error:', e.message);
+    const database = await getDb();
+    if (database) {
+      const col = database.collection(COL_PRODUCTS);
+      const items = await col.find({}).limit(topK).toArray();
+      return res.json({ items });
+    }
+    res.json({ items: [] });
   }
 });
 
