@@ -87,6 +87,10 @@ class HomeFragment : Fragment() {
     private var frozenImageWidth = 0
     private var frozenImageHeight = 0
     private var lockedTargetLabel: String = ""
+    private var lastTargetBox: RectF? = null
+    private var lastTargetZoomRatio = 1.0f
+    private var missedFramesCount = 0
+    private val GHOST_BOX_MAX_MISSED_FRAMES = 30
 
     private val LOCK_CONFIRM_FRAMES = 2
     private var pendingLockBox: OverlayView.DetectionBox? = null
@@ -102,6 +106,7 @@ class HomeFragment : Fragment() {
     private var wasOccluded = false
 
     private val TARGET_CONFIDENCE_THRESHOLD = 0.5f
+    private val TARGET_TRACKING_CONFIDENCE_THRESHOLD = 0.15f  // 줌 아웃 시 타겟 추적용 (낮춤)
     private val currentTargetLabel = AtomicReference<String>("")
 
     private var lastDirectionGuidanceTime = 0L
@@ -112,13 +117,18 @@ class HomeFragment : Fragment() {
     private val ACTION_GUIDANCE_COOLDOWN_MS = 10000L    // "손을 뻗어 확인해보세요" (10초)
     private val SAFE_ZONE_LEFT = 0.3f   // centerXNorm < 0.3 → Left Zone
     private val SAFE_ZONE_RIGHT = 0.7f  // centerXNorm > 0.7 → Right Zone (Safe: 0.3..0.7)
+    private val REACH_ZONE_TOP = 0.35f   // centerYNorm < 0.35 → 위쪽 손 뻗기
+    private val REACH_ZONE_BOTTOM = 0.65f // centerYNorm > 0.65 → 아래쪽 손 뻗기
+    private val SEARCH_PING_INTERVAL_MS = 12000L  // 탐색 침묵 12초 시 핑 안내
+    private var lastSearchPingTime = 0L
     private var lastZoomDecayTime = 0L
     private val TARGET_BOX_RATIO = 0.12f  // 폴백: 거리 계산 실패 시 사용
-    private val CLOSE_DISTANCE_STABILITY_FRAMES = 15    // 500mm 이하 연속 15프레임(~0.5초) 시에만 "손을 뻗어" 허용
+    private val CLOSE_DISTANCE_STABILITY_FRAMES = 30    // 350mm 이하 연속 30프레임(약 1초) 시에만 "손을 뻗어" 허용 (Debounce x2)
     private var closeDistanceFrameCount = 0
     private val ZOOM_DECAY_INTERVAL_MS = 80L
     private val FOCAL_LENGTH_FACTOR = 1.1f   // pinhole: FocalLength = imageHeight * this
-    private val DISTANCE_NEAR_MM = 500f       // 50cm 이하 → "손을 뻗어 확인해보세요"
+    private val DISTANCE_CALIBRATION_FACTOR = 1.5f  // 거리 과소측정 보정 (기기별 FOV/렌즈 튜닝용, 1.3 = 30% 멀게)
+    private val DISTANCE_NEAR_MM = 450f       // 35cm 이하 → "손을 뻗어 확인해보세요" (접촉 판정 거리)
     private val DISTANCE_LONG_RANGE_MM = 1500f // 1.5m 이상 → 걸음수 안내(원거리)
     private val DISTANCE_ZOOM_OUT_MM = 700f   // 700mm 미만 → 1.0x 빠르게 복귀
     private val DISTANCE_ZOOM_IN_MM = 1500f    // 1500mm 이상 → 줌 인
@@ -225,6 +235,13 @@ class HomeFragment : Fragment() {
             }
         }
 
+        sharedViewModel.volumeLongPressTrigger.observe(viewLifecycleOwner) { event ->
+            if (event != null) {
+                sharedViewModel.consumeVolumeLongPressTrigger()
+                onVoiceInputClicked()
+            }
+        }
+
         if (allPermissionsGranted()) {
             startCamera()
             voiceFlowController?.start()
@@ -300,6 +317,7 @@ class HomeFragment : Fragment() {
     /** @param urgent true면 TTS 재생 중이어도 즉시 송출. false면 재생 중이면 무시(Drop). onDone은 마지막에 두어 trailing lambda 사용 가능. */
     private fun speak(text: String, urgent: Boolean = true, onDone: (() -> Unit)? = null) {
         if (!urgent && (ttsManager?.isSpeaking() == true)) return
+        if (!urgent && (waitingForTouchConfirm || touchConfirmInProgress || (sttManager?.isListening() == true))) return
         ttsManager?.speak(text, android.speech.tts.TextToSpeech.QUEUE_FLUSH, onDone)
     }
 
@@ -343,6 +361,10 @@ class HomeFragment : Fragment() {
         lastDistanceGuidanceTime = 0L
         lastActionGuidanceTime = 0L
         lastStepGuidanceTime = 0L
+        lastSearchPingTime = 0L
+        lastTargetBox = null
+        lastTargetZoomRatio = 1.0f
+        missedFramesCount = 0
         lockedTargetLabel = ""
         frozenBox = null
         latestHandsResult.set(null)
@@ -363,6 +385,7 @@ class HomeFragment : Fragment() {
     }
 
     private fun startScanningDirect(targetLabel: String) {
+        cancelSearchTimeout()
         currentTargetLabel.set(targetLabel)
         transitionToSearching(isNewSearchSession = true)
         startCamera()
@@ -828,14 +851,15 @@ class HomeFragment : Fragment() {
         scanRunnable = null
     }
 
-    /** 줌 보정 거리: Real_Pixel_Width = Box_Width_Px / Zoom_Ratio, Distance_mm = (Focal * Physical_mm) / Real_Pixel_Width */
+    /** 줌 보정 거리: raw = (Focal * Physical_mm) / Real_Pixel_Width, 반환 = raw * DISTANCE_CALIBRATION_FACTOR */
     private fun computeDistanceMm(boxWidthPx: Float, imageHeight: Int, label: String, zoomRatio: Float = 1f): Float {
         if (boxWidthPx <= 0f || imageHeight <= 0) return Float.MAX_VALUE
         val zoom = zoomRatio.coerceAtLeast(0.1f)
         val realPixelWidth = boxWidthPx / zoom
         val focalLengthPx = imageHeight * FOCAL_LENGTH_FACTOR
         val physicalWidthMm = ProductDictionary.getPhysicalWidthMm(label)
-        return (focalLengthPx * physicalWidthMm) / realPixelWidth
+        val rawDistanceMm = (focalLengthPx * physicalWidthMm) / realPixelWidth
+        return rawDistanceMm * DISTANCE_CALIBRATION_FACTOR
     }
 
     /** 화면 구역: Left < 0.3, Right > 0.7, Safe 0.3..0.7 (centerXNorm = centerX / imageWidth) */
@@ -851,12 +875,13 @@ class HomeFragment : Fragment() {
     }
 
     private fun processAutoZoom(detections: List<OverlayView.DetectionBox>, imageWidth: Int, imageHeight: Int) {
+        if (waitingForTouchConfirm || touchConfirmInProgress) return
         val target = getTargetLabel().trim()
         if (target.isBlank()) return
         val match = detections.filter { d ->
             (d.label.equals(target, true) || d.topLabels.any { it.first.equals(target, true) }) &&
                 d.confidence >= TARGET_CONFIDENCE_THRESHOLD
-        }.maxByOrNull { it.confidence } ?: return
+        }.maxByOrNull { it.rect.width() * it.rect.height() } ?: return
         val boxCenterX = (match.rect.left + match.rect.right) / 2f
         val centerXNorm = if (imageWidth > 0) boxCenterX / imageWidth else 0.5f
         if (!isInSafeZone(centerXNorm)) {
@@ -902,36 +927,44 @@ class HomeFragment : Fragment() {
         }
     }
 
-    /** 방향 정렬 우선. Safe Zone: 원거리(≥1.5m) 걸음수 안내 → 근거리 시 손 뻗기/앞으로. */
+    /** 1순위: 방향(동적 Safe Zone) → 2순위: 5초 모드 락 → 3순위: 거리(걸음/앞으로/손 뻗기, 15프레임 강제). */
     private fun processDistanceGuidance(box: OverlayView.DetectionBox, imageWidth: Int, imageHeight: Int) {
+        if (waitingForTouchConfirm || touchConfirmInProgress) return
         val cam = camera ?: return
         val totalArea = imageWidth * imageHeight
         if (totalArea <= 0 || imageWidth <= 0) return
         val boxCenterX = (box.rect.left + box.rect.right) / 2f
         val centerXNorm = boxCenterX / imageWidth
-        val boxWidthPx = box.rect.width()
-        val zoomRatio = currentZoomRatio
-        val distanceMm = computeDistanceMm(boxWidthPx, imageHeight, box.label, zoomRatio)
         val now = System.currentTimeMillis()
         requireActivity().runOnUiThread {
+            val boxWidthPx = box.rect.width()
+            val zoomRatio = currentZoomRatio
+            val distMm = computeDistanceMm(boxWidthPx, imageHeight, box.label, zoomRatio)
+            val leftBound = if (distMm <= 500f) 0.15f else 0.3f
+            val rightBound = if (distMm <= 500f) 0.85f else 0.7f
+
             when {
-                centerXNorm < SAFE_ZONE_LEFT -> {
+                centerXNorm < leftBound -> {
                     closeDistanceFrameCount = 0
                     setZoomTo1x()
                     if (now - lastDirectionGuidanceTime >= DIRECTION_GUIDANCE_COOLDOWN_MS) {
                         lastDirectionGuidanceTime = now
-                        speak("왼쪽으로 조금 더 돌리세요", false)
+                        speak("왼방향으로 회전하세요.", false)
                     }
+                    return@runOnUiThread
                 }
-                centerXNorm > SAFE_ZONE_RIGHT -> {
+                centerXNorm > rightBound -> {
                     closeDistanceFrameCount = 0
                     setZoomTo1x()
                     if (now - lastDirectionGuidanceTime >= DIRECTION_GUIDANCE_COOLDOWN_MS) {
                         lastDirectionGuidanceTime = now
-                        speak("오른쪽으로 조금 더 돌리세요", false)
+                        speak("오른방향으로 회전하세요.", false)
                     }
+                    return@runOnUiThread
                 }
                 else -> {
+                    if (now - lastStepGuidanceTime < STEP_GUIDANCE_PAUSE_MS) return@runOnUiThread
+                    val distanceMm = distMm
                     val boxRatio = (box.rect.width() * box.rect.height()) / totalArea
                     val zoom = currentZoomRatio
                     val newZoom = max(1.0f, currentZoomRatio * 0.95f)
@@ -941,22 +974,32 @@ class HomeFragment : Fragment() {
                         currentZoomRatio = newZoom
                     }
                     when {
-                        distanceMm >= DISTANCE_LONG_RANGE_MM -> {
+                        distanceMm >= DISTANCE_LONG_RANGE_MM && distanceMm.isFinite() && distanceMm <= 50000f -> {
                             setZoomTo1x()
                             if (now - lastStepGuidanceTime >= STEP_GUIDANCE_PAUSE_MS) {
                                 lastStepGuidanceTime = now
-                                val distanceM = (distanceMm / 1000f).toInt().coerceAtLeast(1)
+                                val distanceM = (distanceMm / 1000f).toInt().coerceIn(1, 50)
                                 val steps = (distanceMm / STEP_STRIDE_MM).toInt().coerceAtLeast(1)
-                                speak("전방 ${distanceM}미터에 있습니다. 약 ${steps}걸음 앞으로 걸어가세요.", false)
+                                speak("주변 장애물에 주의하며, 약 ${steps}걸음 앞으로 걸어가세요.", false)
                             }
                         }
                         distanceMm <= DISTANCE_NEAR_MM -> {
-                            closeDistanceFrameCount++
-                            if (closeDistanceFrameCount >= CLOSE_DISTANCE_STABILITY_FRAMES &&
-                                now - lastActionGuidanceTime >= ACTION_GUIDANCE_COOLDOWN_MS) {
-                                lastActionGuidanceTime = now
+                            if (missedFramesCount > 0) {
                                 closeDistanceFrameCount = 0
-                                speak("손을 뻗어 확인해보세요", false)
+                            } else {
+                                closeDistanceFrameCount++
+                                if (closeDistanceFrameCount >= CLOSE_DISTANCE_STABILITY_FRAMES &&
+                                    now - lastActionGuidanceTime >= ACTION_GUIDANCE_COOLDOWN_MS) {
+                                    lastActionGuidanceTime = now
+                                    closeDistanceFrameCount = 0
+                                    val centerYNorm = (box.rect.top + box.rect.bottom) / 2f / imageHeight.coerceAtLeast(1)
+                                    val reachMsg = when {
+                                        centerYNorm < REACH_ZONE_TOP -> "위쪽으로 손을 뻗어 확인해보세요."
+                                        centerYNorm > REACH_ZONE_BOTTOM -> "아래쪽으로 손을 뻗어 확인해보세요."
+                                        else -> "정면으로 손을 뻗어 확인해보세요."
+                                    }
+                                    speak(reachMsg, false)
+                                }
                             }
                         }
                         else -> {
@@ -1003,7 +1046,7 @@ class HomeFragment : Fragment() {
                 (cx - px) * (cx - px) + (cy - py) * (cy - py)
             }
             prevBox != null -> candidates.maxByOrNull { iou(it.rect, prevBox.rect) }
-            else -> candidates.maxByOrNull { it.confidence }
+            else -> candidates.maxByOrNull { it.rect.width() * it.rect.height() }
         }
     }
 
@@ -1015,7 +1058,7 @@ class HomeFragment : Fragment() {
                 box.label.trim().equals(target, ignoreCase = true) -> box.confidence
                 else -> box.topLabels.find { it.first.trim().equals(target, ignoreCase = true) }?.second?.div(100f)
             }
-            if (targetConf != null && targetConf >= TARGET_CONFIDENCE_THRESHOLD) {
+            if (targetConf != null && targetConf >= TARGET_TRACKING_CONFIDENCE_THRESHOLD) {
                 if (box.label.trim().equals(target, ignoreCase = true)) box
                 else box.copy(label = target, confidence = targetConf, topLabels = listOf(target to (targetConf * 100).toInt()))
             } else null
@@ -1030,12 +1073,12 @@ class HomeFragment : Fragment() {
                 box.label.trim().equals(target, ignoreCase = true) -> box.confidence
                 else -> box.topLabels.find { it.first.trim().equals(target, ignoreCase = true) }?.second?.div(100f)
             }
-            if (targetConf != null && targetConf >= TARGET_CONFIDENCE_THRESHOLD) {
+            if (targetConf != null && targetConf >= TARGET_TRACKING_CONFIDENCE_THRESHOLD) {
                 val displayBox = if (box.label.trim().equals(target, ignoreCase = true)) box
                 else box.copy(label = target, confidence = targetConf, topLabels = listOf(target to (targetConf * 100).toInt()))
                 Pair(displayBox, box.label)
             } else null
-        }.maxByOrNull { it.first.confidence }
+        }.maxByOrNull { (box, _) -> box.rect.width() * box.rect.height() }
     }
 
     private fun transitionToLocked(box: OverlayView.DetectionBox, imageWidth: Int, imageHeight: Int, actualPrimaryLabel: String? = null) {
@@ -1060,6 +1103,9 @@ class HomeFragment : Fragment() {
             releaseFrameCount = 0
             touchActive = false
             closeDistanceFrameCount = 0
+            lastTargetBox = box.rect
+            lastTargetZoomRatio = currentZoomRatio
+            missedFramesCount = 0
             lastTouchMidpointPx = null
             lastTouchTtsTimeMs = 0L
             latestHandsResult.set(null)
@@ -1119,7 +1165,11 @@ class HomeFragment : Fragment() {
             lastActionGuidanceTime = 0L
             lastStepGuidanceTime = 0L
             closeDistanceFrameCount = 0
+            lastTargetBox = null
+            lastTargetZoomRatio = 1.0f
+            missedFramesCount = 0
             lastZoomDecayTime = 0L
+            lastSearchPingTime = System.currentTimeMillis()
             latestHandsResult.set(null)
             opticalFlowTracker.reset()
             gyroManager.stopTracking()
@@ -1281,9 +1331,14 @@ class HomeFragment : Fragment() {
             val output = Array(outputShape[0]) { Array(outputShape[1]) { FloatArray(outputShape[2]) } }
             yoloxInterpreter!!.run(inputBuffer, output)
             if (isImageTooDark(bitmap)) return emptyList()
+            val targetLabel = when (searchState) {
+                SearchState.SEARCHING -> getTargetLabel().takeIf { it.isNotBlank() }
+                SearchState.LOCKED -> lockedTargetLabel.takeIf { it.isNotBlank() }
+                else -> null
+            }
             return parseYOLOXOutput(
                 output[0], outputShape[1], outputShape[2],
-                bitmap.width, bitmap.height, inputSize, letterboxScaleR = letterboxScale
+                bitmap.width, bitmap.height, inputSize, letterboxScaleR = letterboxScale, targetLabel = targetLabel
             )
         } catch (e: Exception) {
             Log.e(TAG, "YOLOX 추론 실패", e)
@@ -1296,7 +1351,8 @@ class HomeFragment : Fragment() {
         dim1: Int, dim2: Int,
         imageWidth: Int, imageHeight: Int,
         inputSize: Int,
-        letterboxScaleR: Float? = null
+        letterboxScaleR: Float? = null,
+        targetLabel: String? = null
     ): List<OverlayView.DetectionBox> {
         val numBoxes: Int
         val boxSize: Int
@@ -1357,7 +1413,10 @@ class HomeFragment : Fragment() {
                 .sortedByDescending { it.second }
                 .take(3)
             val confidence = topClassIds.firstOrNull()?.second ?: 0f
-            if (confidence < minConfidenceToShow) continue
+            val topLabel = topClassIds.firstOrNull()?.let { getClassLabel(it.first) } ?: ""
+            val minForThis = if (targetLabel != null && topLabel.trim().equals(targetLabel.trim(), ignoreCase = true))
+                TARGET_TRACKING_CONFIDENCE_THRESHOLD else minConfidenceToShow
+            if (confidence < minForThis) continue
 
             val topLabels = topClassIds
                 .filter { (_, conf) -> conf >= 0.5f }
@@ -1658,6 +1717,13 @@ class HomeFragment : Fragment() {
                         } else {
                             pendingLockBox = null
                             pendingLockCount = 0
+                            val nowPing = System.currentTimeMillis()
+                            if (nowPing - lastSearchPingTime >= SEARCH_PING_INTERVAL_MS) {
+                                requireActivity().runOnUiThread {
+                                    lastSearchPingTime = System.currentTimeMillis()
+                                    speak("천천히 주변을 더 넓게 비춰보세요", false)
+                                }
+                            }
                         }
                         displayResults(filterDetectionsByTarget(detections, getTargetLabel()), inferMs, w, h)
                     }
@@ -1704,9 +1770,12 @@ class HomeFragment : Fragment() {
                         if (shouldReacquire) {
                             val detections = runYOLOX(bitmap)
                             inferMs = System.currentTimeMillis() - startTime
-                            val tracked = findTrackedTarget(detections, lockedTargetLabel, frozenBox, 0.18f)
+                            val tracked = findTrackedTarget(detections, lockedTargetLabel, frozenBox, TARGET_TRACKING_CONFIDENCE_THRESHOLD)
                             if (tracked != null) {
                                 lastSuccessfulValidationTimeMs = System.currentTimeMillis()
+                                lastTargetBox = tracked.rect
+                                lastTargetZoomRatio = currentZoomRatio
+                                missedFramesCount = 0
                                 gyroManager.correctPosition(tracked.rect)
                                 frozenBox = tracked.copy(rotationDegrees = 0f)
                                 frozenImageWidth = w
@@ -1736,11 +1805,14 @@ class HomeFragment : Fragment() {
                         if (shouldValidate) {
                             val detections = runYOLOX(bitmap)
                             inferMs = System.currentTimeMillis() - startTime
-                            val minConf = if (shouldReacquire) 0.18f else 0.22f
+                            val minConf = TARGET_TRACKING_CONFIDENCE_THRESHOLD
                             val tracked = findTrackedTarget(detections, lockedTargetLabel, frozenBox, minConf)
                             if (tracked != null) {
                                 validationFailCount = 0
                                 lastSuccessfulValidationTimeMs = System.currentTimeMillis()
+                                lastTargetBox = tracked.rect
+                                lastTargetZoomRatio = currentZoomRatio
+                                missedFramesCount = 0
                                 val cur = frozenBox?.rect ?: tracked.rect
                                 val blend = 0.7f
                                 val blendedRect = RectF(
@@ -1760,6 +1832,30 @@ class HomeFragment : Fragment() {
                                     lastTouchTtsTimeMs = 0L
                                 }
                             } else {
+                                missedFramesCount++
+                                if (missedFramesCount < GHOST_BOX_MAX_MISSED_FRAMES && lastTargetBox != null) {
+                                    val zoomDenom = lastTargetZoomRatio.coerceAtLeast(0.1f)
+                                    val scale = currentZoomRatio / zoomDenom
+                                    val r = lastTargetBox!!
+                                    val screenCenterX = w / 2f
+                                    val screenCenterY = h / 2f
+                                    val oldBoxCenterX = r.centerX()
+                                    val oldBoxCenterY = r.centerY()
+                                    val oldWidth = r.width()
+                                    val oldHeight = r.height()
+                                    val newBoxCenterX = screenCenterX + (oldBoxCenterX - screenCenterX) * scale
+                                    val newBoxCenterY = screenCenterY + (oldBoxCenterY - screenCenterY) * scale
+                                    val newWidth = oldWidth * scale
+                                    val newHeight = oldHeight * scale
+                                    val ghostRect = RectF(
+                                        newBoxCenterX - newWidth / 2f,
+                                        newBoxCenterY - newHeight / 2f,
+                                        newBoxCenterX + newWidth / 2f,
+                                        newBoxCenterY + newHeight / 2f
+                                    )
+                                    frozenBox = (frozenBox ?: OverlayView.DetectionBox(lockedTargetLabel, 0.5f, ghostRect, listOf(lockedTargetLabel to 50)))
+                                        .copy(rect = ghostRect)
+                                }
                                 validationFailCount++
                                 if (validationFailCount >= VALIDATION_FAIL_LIMIT) {
                                     validationFailCount = 0
