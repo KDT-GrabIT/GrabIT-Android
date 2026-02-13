@@ -11,6 +11,7 @@ local.properties
 
 # Python (YOLOX 변환 등)
 venv/
+.venv/
 __pycache__/
 *.py[cod]
 *.pyo
