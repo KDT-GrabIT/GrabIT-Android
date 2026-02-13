@@ -119,8 +119,12 @@ class HomeFragment : Fragment() {
     private val ZOOM_DECAY_INTERVAL_MS = 80L
     private val FOCAL_LENGTH_FACTOR = 1.1f   // pinhole: FocalLength = imageHeight * this
     private val DISTANCE_NEAR_MM = 500f       // 50cm 이하 → "손을 뻗어 확인해보세요"
+    private val DISTANCE_LONG_RANGE_MM = 1500f // 1.5m 이상 → 걸음수 안내(원거리)
     private val DISTANCE_ZOOM_OUT_MM = 700f   // 700mm 미만 → 1.0x 빠르게 복귀
     private val DISTANCE_ZOOM_IN_MM = 1500f    // 1500mm 이상 → 줌 인
+    private val STEP_STRIDE_MM = 650f          // 성인 평균 보폭 65cm
+    private val STEP_GUIDANCE_PAUSE_MS = 5000L // 걸음 안내 후 5초간 추가 안내 휴식
+    private var lastStepGuidanceTime = 0L
     private val MAX_ZOOM_SCAN = 2.5f           // 거리 기반 줌 최대 2.5x
     private val ZOOM_LERP_SPEED_OUT = 0.5f
     private val ZOOM_LERP_SPEED_IN = 0.04f
@@ -335,6 +339,7 @@ class HomeFragment : Fragment() {
         lastDirectionGuidanceTime = 0L
         lastDistanceGuidanceTime = 0L
         lastActionGuidanceTime = 0L
+        lastStepGuidanceTime = 0L
         lockedTargetLabel = ""
         frozenBox = null
         latestHandsResult.set(null)
@@ -820,12 +825,14 @@ class HomeFragment : Fragment() {
         scanRunnable = null
     }
 
-    /** Pinhole: Distance_mm = (FocalLength_px * RealObjectWidth_mm) / BoundingBoxWidth_px, FocalLength = imageHeight * 1.1 */
-    private fun computeDistanceMm(boxWidthPx: Float, imageHeight: Int, label: String): Float {
+    /** 줌 보정 거리: Real_Pixel_Width = Box_Width_Px / Zoom_Ratio, Distance_mm = (Focal * Physical_mm) / Real_Pixel_Width */
+    private fun computeDistanceMm(boxWidthPx: Float, imageHeight: Int, label: String, zoomRatio: Float = 1f): Float {
         if (boxWidthPx <= 0f || imageHeight <= 0) return Float.MAX_VALUE
+        val zoom = zoomRatio.coerceAtLeast(0.1f)
+        val realPixelWidth = boxWidthPx / zoom
         val focalLengthPx = imageHeight * FOCAL_LENGTH_FACTOR
         val physicalWidthMm = ProductDictionary.getPhysicalWidthMm(label)
-        return (focalLengthPx * physicalWidthMm) / boxWidthPx
+        return (focalLengthPx * physicalWidthMm) / realPixelWidth
     }
 
     /** 화면 구역: Left < 0.3, Right > 0.7, Safe 0.3..0.7 (centerXNorm = centerX / imageWidth) */
@@ -856,7 +863,7 @@ class HomeFragment : Fragment() {
             return
         }
         val boxWidthPx = match.rect.width()
-        val distanceMm = computeDistanceMm(boxWidthPx, imageHeight, match.label)
+        val distanceMm = computeDistanceMm(boxWidthPx, imageHeight, match.label, currentZoomRatio)
         val cam = camera ?: return
         val shouldZoomOutFast = distanceMm < DISTANCE_ZOOM_OUT_MM
         val shouldZoomOutSlow = distanceMm in DISTANCE_ZOOM_OUT_MM..DISTANCE_ZOOM_IN_MM
@@ -892,7 +899,7 @@ class HomeFragment : Fragment() {
         }
     }
 
-    /** 방향 정렬 우선: Left/Right Zone에서는 접근 안내·줌 금지. Safe Zone에서만 거리 안내. 쿨다운·안정화 적용. */
+    /** 방향 정렬 우선. Safe Zone: 원거리(≥1.5m) 걸음수 안내 → 근거리 시 손 뻗기/앞으로. */
     private fun processDistanceGuidance(box: OverlayView.DetectionBox, imageWidth: Int, imageHeight: Int) {
         val cam = camera ?: return
         val totalArea = imageWidth * imageHeight
@@ -900,7 +907,8 @@ class HomeFragment : Fragment() {
         val boxCenterX = (box.rect.left + box.rect.right) / 2f
         val centerXNorm = boxCenterX / imageWidth
         val boxWidthPx = box.rect.width()
-        val distanceMm = computeDistanceMm(boxWidthPx, imageHeight, box.label)
+        val zoomRatio = currentZoomRatio
+        val distanceMm = computeDistanceMm(boxWidthPx, imageHeight, box.label, zoomRatio)
         val now = System.currentTimeMillis()
         requireActivity().runOnUiThread {
             when {
@@ -929,20 +937,32 @@ class HomeFragment : Fragment() {
                         cam.cameraControl.setZoomRatio(newZoom)
                         currentZoomRatio = newZoom
                     }
-                    if (distanceMm <= DISTANCE_NEAR_MM) {
-                        closeDistanceFrameCount++
-                        if (closeDistanceFrameCount >= CLOSE_DISTANCE_STABILITY_FRAMES &&
-                            now - lastActionGuidanceTime >= ACTION_GUIDANCE_COOLDOWN_MS) {
-                            lastActionGuidanceTime = now
-                            closeDistanceFrameCount = 0
-                            speak("손을 뻗어 확인해보세요", false)
+                    when {
+                        distanceMm >= DISTANCE_LONG_RANGE_MM -> {
+                            setZoomTo1x()
+                            if (now - lastStepGuidanceTime >= STEP_GUIDANCE_PAUSE_MS) {
+                                lastStepGuidanceTime = now
+                                val distanceM = (distanceMm / 1000f).toInt().coerceAtLeast(1)
+                                val steps = (distanceMm / STEP_STRIDE_MM).toInt().coerceAtLeast(1)
+                                speak("전방 ${distanceM}미터에 있습니다. 약 ${steps}걸음 앞으로 걸어가세요.", false)
+                            }
                         }
-                    } else {
-                        closeDistanceFrameCount = 0
-                        if (now - lastDistanceGuidanceTime >= DISTANCE_GUIDANCE_COOLDOWN_MS &&
-                            zoom <= 1.2f && boxRatio < TARGET_BOX_RATIO) {
-                            lastDistanceGuidanceTime = now
-                            speak("조금 더 앞으로 오세요", false)
+                        distanceMm <= DISTANCE_NEAR_MM -> {
+                            closeDistanceFrameCount++
+                            if (closeDistanceFrameCount >= CLOSE_DISTANCE_STABILITY_FRAMES &&
+                                now - lastActionGuidanceTime >= ACTION_GUIDANCE_COOLDOWN_MS) {
+                                lastActionGuidanceTime = now
+                                closeDistanceFrameCount = 0
+                                speak("손을 뻗어 확인해보세요", false)
+                            }
+                        }
+                        else -> {
+                            closeDistanceFrameCount = 0
+                            if (now - lastDistanceGuidanceTime >= DISTANCE_GUIDANCE_COOLDOWN_MS &&
+                                zoom <= 1.2f && boxRatio < TARGET_BOX_RATIO) {
+                                lastDistanceGuidanceTime = now
+                                speak("조금 더 앞으로 오세요", false)
+                            }
                         }
                     }
                 }
@@ -1087,6 +1107,7 @@ class HomeFragment : Fragment() {
             lastDirectionGuidanceTime = 0L
             lastDistanceGuidanceTime = 0L
             lastActionGuidanceTime = 0L
+            lastStepGuidanceTime = 0L
             closeDistanceFrameCount = 0
             lastZoomDecayTime = 0L
             latestHandsResult.set(null)
