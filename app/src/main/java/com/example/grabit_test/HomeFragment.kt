@@ -182,9 +182,11 @@ class HomeFragment : Fragment() {
     private var hasAnnouncedDetectedThisSearchSession = false
     private var touchConfirmInProgress = false
     private var touchConfirmScheduled = false
+    private var touchConfirmAskedTime = 0L
+    private val TOUCH_CONFIRM_ANSWER_WAIT_MS = 3000L
 
     private val TOUCH_BOX_EXPAND_RATIO = 0.22f
-    private val TOUCH_CONFIRM_FRAMES = 4
+    private val TOUCH_CONFIRM_FRAMES = 30
     private val RELEASE_HOLD_FRAMES = 10
     private val TOUCH_TTS_COOLDOWN_MS = 1800L
 
@@ -314,8 +316,11 @@ class HomeFragment : Fragment() {
         }
     }
 
-    /** @param urgent true면 TTS 재생 중이어도 즉시 송출. false면 재생 중이면 무시(Drop). onDone은 마지막에 두어 trailing lambda 사용 가능. */
-    private fun speak(text: String, urgent: Boolean = true, onDone: (() -> Unit)? = null) {
+    /** @param urgent true면 TTS 재생 중이어도 즉시 송출. false면 재생 중이면 무시(Drop).
+     * @param isAutoGuidance true면 STT 대화 직후 4초 breathing room 동안 무시(Drop).
+     * onDone은 마지막 인자로 두어 trailing lambda 사용 가능. */
+    private fun speak(text: String, urgent: Boolean = true, isAutoGuidance: Boolean = true, onDone: (() -> Unit)? = null) {
+        if (isAutoGuidance && (voiceFlowController?.isInSttBreathingRoom() == true)) return
         if (!urgent && (ttsManager?.isSpeaking() == true)) return
         if (!urgent && (waitingForTouchConfirm || touchConfirmInProgress || (sttManager?.isListening() == true))) return
         ttsManager?.speak(text, android.speech.tts.TextToSpeech.QUEUE_FLUSH, onDone)
@@ -329,6 +334,7 @@ class HomeFragment : Fragment() {
         binding.voiceButtonArea.visibility = if (showButton) View.VISIBLE else View.GONE
     }
 
+    /** 완전 무결점 초기화(Kill-All Reset). 탭 전환·TOUCH_CONFIRM 긍정 종료 시 호출. */
     private fun resetGlobalState() {
         camera?.cameraControl?.setZoomRatio(1.0f)
         currentZoomRatio = 1.0f
@@ -352,6 +358,9 @@ class HomeFragment : Fragment() {
         touchConfirmInProgress = false
         touchConfirmScheduled = false
         touchActive = false
+        touchFrameCount = 0
+        releaseFrameCount = 0
+        lastTouchTtsTimeMs = 0L
         wasOccluded = false
         pendingLockBox = null
         pendingLockCount = 0
@@ -367,11 +376,14 @@ class HomeFragment : Fragment() {
         missedFramesCount = 0
         lockedTargetLabel = ""
         frozenBox = null
+        frozenImageWidth = 0
+        frozenImageHeight = 0
         latestHandsResult.set(null)
         opticalFlowTracker.reset()
         if (::gyroManager.isInitialized) {
             try { gyroManager.stopTracking() } catch (_: Exception) {}
         }
+        voiceFlowController?.resetBreathingRoom()
         voiceFlowController?.start()
         _binding?.let { b ->
             b.overlayView.setDetections(emptyList(), 0, 0)
@@ -419,6 +431,7 @@ class HomeFragment : Fragment() {
                         onProductNameEntered = { productName -> requireActivity().runOnUiThread { setTargetFromSpokenProductName(productName) } }
                     )
                     voiceFlowController?.start()
+                    speak(VoiceFlowController.MSG_APP_START, urgent = true, isAutoGuidance = false)
                 }
             }
         }
@@ -438,17 +451,22 @@ class HomeFragment : Fragment() {
                         voiceConfirmSilentRetryCount = 0
                     }
                     voiceFlowController?.onSttResult(text)
+                    voiceFlowController?.notifySttEnded()
                 }
             },
             onError = { msg ->
                 requireActivity().runOnUiThread {
                     binding.systemMessageText.text = msg
                     if (waitingForTouchConfirm) {
-                        waitingForTouchConfirm = false
-                        binding.systemMessageText.text = "손을 뻗어 잡아주세요"
-                        touchActive = false
-                        startPositionAnnounce()
-                        Toast.makeText(requireContext(), "음성 인식 실패. 다시 시도해주세요.", Toast.LENGTH_SHORT).show()
+                        if (System.currentTimeMillis() - touchConfirmAskedTime >= TOUCH_CONFIRM_ANSWER_WAIT_MS) {
+                            waitingForTouchConfirm = false
+                            binding.systemMessageText.text = "손을 뻗어 잡아주세요"
+                            touchActive = false
+                            startPositionAnnounce()
+                            Toast.makeText(requireContext(), "음성 인식 실패. 다시 시도해주세요.", Toast.LENGTH_SHORT).show()
+                        } else {
+                            view?.postDelayed({ if (waitingForTouchConfirm) sttManager?.startListening() }, 400L)
+                        }
                     } else {
                         Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show()
                     }
@@ -498,6 +516,10 @@ class HomeFragment : Fragment() {
                             }
                         } else {
                             if (isTouchConfirm) {
+                                if (System.currentTimeMillis() - touchConfirmAskedTime < TOUCH_CONFIRM_ANSWER_WAIT_MS) {
+                                    view?.postDelayed({ if (waitingForTouchConfirm) sttManager?.startListening() }, 400L)
+                                    return@runOnUiThread
+                                }
                                 touchConfirmSttRetryCount = 0
                                 waitingForTouchConfirm = false
                                 binding.systemMessageText.text = "손을 뻗어 잡아주세요"
@@ -555,9 +577,11 @@ class HomeFragment : Fragment() {
                         sttManager?.stopListening()
                         if (waitingForTouchConfirm) {
                             waitingForTouchConfirm = false
+                            voiceFlowController?.notifySttEnded()
                             handleTouchConfirmYesNo(text)
                         } else {
                             voiceFlowController?.onSttResult(text)
+                            voiceFlowController?.notifySttEnded()
                         }
                     }
                 }
@@ -642,16 +666,46 @@ class HomeFragment : Fragment() {
     private fun handleTouchConfirmYesNo(text: String) {
         val t = text.trim().lowercase().replace(" ", "")
         val isYes = t.contains("예") || t.contains("네") || t.contains("내") || t.contains("응") ||
-            t.contains("맞") || t.contains("그래") || t.contains("좋아") || t == "yes" || t == "y"
-        val isExplicitNo = t.contains("아니") || t.contains("아직") || t.contains("없어") || t == "no" || t == "n"
+            t.contains("맞") || t.contains("그래") || t.contains("좋아") || t.contains("찾았") || t.contains("닿았") ||
+            t == "yes" || t == "y"
+        val isExplicitNo = t.contains("아니") || t.contains("아직") || t.contains("없어") || t.contains("못 찾") || t == "no" || t == "n"
         when {
-            isYes -> speak(VoicePrompts.PROMPT_DONE) { resetToIdleFromTouch() }
+            isYes -> {
+                requireActivity().runOnUiThread {
+                    sttManager?.cancelListening()
+                    touchConfirmInProgress = false
+                    touchConfirmScheduled = false
+                    waitingForTouchConfirm = false
+                    touchActive = false
+                    touchFrameCount = 0
+                    releaseFrameCount = 0
+                    speak(VoicePrompts.PROMPT_FOUND_AND_END, urgent = true, isAutoGuidance = false)
+                    performKillAllResetFromTouch()
+                }
+            }
             isExplicitNo -> resetTouchConfirmAndRetrack()
-            else -> speak(VoicePrompts.PROMPT_TOUCH_RESTART) { resetToIdleFromTouch() }
+            else -> speak(VoicePrompts.PROMPT_TOUCH_RESTART, urgent = true, isAutoGuidance = false) {
+                requireActivity().runOnUiThread { performKillAllResetFromTouch() }
+            }
         }
     }
 
-    /** '손 닿았나요?'에 부정 답변 시: TOUCH_CONFIRM 해제, 재추적로 돌아감 */
+    /** 긍정 대답 또는 재시작 시: IDLE·타겟 삭제·전역 리셋·카메라 재시작(일반 프리뷰). runOnUiThread 내부에서 호출. */
+    private fun performKillAllResetFromTouch() {
+        searchState = SearchState.IDLE
+        currentTargetLabel.set("")
+        lockedTargetLabel = ""
+        resetGlobalState()
+        stopCamera()
+        _binding?.overlayView?.setDetections(emptyList(), 0, 0)
+        _binding?.overlayView?.setFrozen(false)
+        updateSearchTargetLabel()
+        updateVoiceButtonVisibility()
+        binding.systemMessageText.text = ""
+        startCamera()
+    }
+
+    /** '손 닿았나요?'에 부정 답변 시: 쿨다운·롤백 후 4초간 TOUCH_CONFIRM 재진입 락 */
     private fun resetTouchConfirmAndRetrack() {
         requireActivity().runOnUiThread {
             sttManager?.cancelListening()
@@ -661,7 +715,10 @@ class HomeFragment : Fragment() {
             touchActive = false
             touchFrameCount = 0
             releaseFrameCount = 0
-            speak("다시 위치를 확인합니다.") {
+            closeDistanceFrameCount = 0
+            missedFramesCount = 0
+            voiceFlowController?.notifySttEnded()
+            speak("다시 위치를 확인합니다.", urgent = true, isAutoGuidance = false) {
                 requireActivity().runOnUiThread {
                     startPositionAnnounce()
                     binding.systemMessageText.text = "손을 뻗어 잡아주세요"
@@ -675,8 +732,9 @@ class HomeFragment : Fragment() {
         touchConfirmInProgress = true
         touchConfirmScheduled = false
         waitingForTouchConfirm = true
+        touchConfirmAskedTime = System.currentTimeMillis()
         touchConfirmSttRetryCount = 0
-        speak("상품에 닿았나요? 닿았으면 예라고 말해주세요.") {
+        speak("상품에 닿았나요? 닿았으면 예라고 말해주세요.", urgent = true, isAutoGuidance = false) {
             requireActivity().runOnUiThread { sttManager?.startListening() }
         }
     }
@@ -689,12 +747,8 @@ class HomeFragment : Fragment() {
             touchActive = false
             touchFrameCount = 0
             releaseFrameCount = 0
-            transitionToSearching(isNewSearchSession = true)
-            stopCamera()
-            currentTargetLabel.set("")
-            updateSearchTargetLabel()
-            updateVoiceButtonVisibility()
-            speak(VoicePrompts.PROMPT_IDLE_TOUCH) {}
+            performKillAllResetFromTouch()
+            speak(VoicePrompts.PROMPT_IDLE_TOUCH, urgent = true, isAutoGuidance = false)
         }
     }
 
@@ -927,7 +981,7 @@ class HomeFragment : Fragment() {
         }
     }
 
-    /** 1순위: 방향(동적 Safe Zone) → 2순위: 5초 모드 락 → 3순위: 거리(걸음/앞으로/손 뻗기, 15프레임 강제). */
+    /** 1순위: 방향(동적 Safe Zone) → 2순위: 5초 모드 락 → 3순위: 거리(걸음/앞으로/손 뻗기). 400mm 이하 시 조준 생략(코앞 뺑뺑이 방지). */
     private fun processDistanceGuidance(box: OverlayView.DetectionBox, imageWidth: Int, imageHeight: Int) {
         if (waitingForTouchConfirm || touchConfirmInProgress) return
         val cam = camera ?: return
@@ -935,13 +989,47 @@ class HomeFragment : Fragment() {
         if (totalArea <= 0 || imageWidth <= 0) return
         val boxCenterX = (box.rect.left + box.rect.right) / 2f
         val centerXNorm = boxCenterX / imageWidth
+        val centerYNorm = (box.rect.top + box.rect.bottom) / 2f / imageHeight.coerceAtLeast(1)
         val now = System.currentTimeMillis()
         requireActivity().runOnUiThread {
             val boxWidthPx = box.rect.width()
             val zoomRatio = currentZoomRatio
             val distMm = computeDistanceMm(boxWidthPx, imageHeight, box.label, zoomRatio)
+
+            if (voiceFlowController?.isInSttBreathingRoom() == true) return@runOnUiThread
+
+            if (distMm <= 400f) {
+                val inEdgeGuard = centerXNorm < 0.05f || centerXNorm > 0.95f || centerYNorm < 0.05f || centerYNorm > 0.95f
+                if (!inEdgeGuard) {
+                    if (now - lastStepGuidanceTime < STEP_GUIDANCE_PAUSE_MS) return@runOnUiThread
+                    when {
+                        distMm <= DISTANCE_NEAR_MM -> {
+                            if (missedFramesCount > 0) {
+                                closeDistanceFrameCount = 0
+                            } else {
+                                closeDistanceFrameCount++
+                                if (closeDistanceFrameCount >= CLOSE_DISTANCE_STABILITY_FRAMES &&
+                                    now - lastActionGuidanceTime >= ACTION_GUIDANCE_COOLDOWN_MS) {
+                                    lastActionGuidanceTime = now
+                                    closeDistanceFrameCount = 0
+                                    val reachMsg = when {
+                                        centerYNorm < REACH_ZONE_TOP -> "위쪽으로 손을 뻗어 확인해보세요."
+                                        centerYNorm > REACH_ZONE_BOTTOM -> "아래쪽으로 손을 뻗어 확인해보세요."
+                                        else -> "정면으로 손을 뻗어 확인해보세요."
+                                    }
+                                    speak(reachMsg, false)
+                                }
+                            }
+                        }
+                        else -> { }
+                    }
+                    return@runOnUiThread
+                }
+            }
+
             val leftBound = if (distMm <= 500f) 0.15f else 0.3f
             val rightBound = if (distMm <= 500f) 0.85f else 0.7f
+            val offset = centerXNorm - 0.5f
 
             when {
                 centerXNorm < leftBound -> {
@@ -949,7 +1037,8 @@ class HomeFragment : Fragment() {
                     setZoomTo1x()
                     if (now - lastDirectionGuidanceTime >= DIRECTION_GUIDANCE_COOLDOWN_MS) {
                         lastDirectionGuidanceTime = now
-                        speak("왼방향으로 회전하세요.", false)
+                        val msg = if (offset < -0.25f) "왼방향으로 많이 회전하세요." else "왼방향으로 살짝 회전하세요."
+                        speak(msg, false)
                     }
                     return@runOnUiThread
                 }
@@ -958,7 +1047,8 @@ class HomeFragment : Fragment() {
                     setZoomTo1x()
                     if (now - lastDirectionGuidanceTime >= DIRECTION_GUIDANCE_COOLDOWN_MS) {
                         lastDirectionGuidanceTime = now
-                        speak("오른방향으로 회전하세요.", false)
+                        val msg = if (offset > 0.25f) "오른방향으로 많이 회전하세요." else "오른방향으로 살짝 회전하세요."
+                        speak(msg, false)
                     }
                     return@runOnUiThread
                 }
@@ -992,7 +1082,6 @@ class HomeFragment : Fragment() {
                                     now - lastActionGuidanceTime >= ACTION_GUIDANCE_COOLDOWN_MS) {
                                     lastActionGuidanceTime = now
                                     closeDistanceFrameCount = 0
-                                    val centerYNorm = (box.rect.top + box.rect.bottom) / 2f / imageHeight.coerceAtLeast(1)
                                     val reachMsg = when {
                                         centerYNorm < REACH_ZONE_TOP -> "위쪽으로 손을 뻗어 확인해보세요."
                                         centerYNorm > REACH_ZONE_BOTTOM -> "아래쪽으로 손을 뻗어 확인해보세요."
@@ -1094,9 +1183,6 @@ class HomeFragment : Fragment() {
             ttsGrabPlayed = false
             ttsGrabbedPlayed = false
             ttsAskAnotherPlayed = false
-            touchConfirmInProgress = false
-            touchConfirmScheduled = false
-            waitingForTouchConfirm = false
             handsOverlapFrameCount = 0
             pinchGrabFrameCount = 0
             touchFrameCount = 0
@@ -1104,6 +1190,11 @@ class HomeFragment : Fragment() {
             touchActive = false
             closeDistanceFrameCount = 0
             lastTargetBox = box.rect
+            if (System.currentTimeMillis() - touchConfirmAskedTime >= TOUCH_CONFIRM_ANSWER_WAIT_MS) {
+                touchConfirmInProgress = false
+                touchConfirmScheduled = false
+                waitingForTouchConfirm = false
+            }
             lastTargetZoomRatio = currentZoomRatio
             missedFramesCount = 0
             lastTouchMidpointPx = null
@@ -1150,9 +1241,6 @@ class HomeFragment : Fragment() {
             ttsGrabPlayed = false
             ttsGrabbedPlayed = false
             ttsAskAnotherPlayed = false
-            touchConfirmInProgress = false
-            touchConfirmScheduled = false
-            waitingForTouchConfirm = false
             handsOverlapFrameCount = 0
             pinchGrabFrameCount = 0
             touchFrameCount = 0
@@ -1172,6 +1260,11 @@ class HomeFragment : Fragment() {
             lastSearchPingTime = System.currentTimeMillis()
             latestHandsResult.set(null)
             opticalFlowTracker.reset()
+            if (System.currentTimeMillis() - touchConfirmAskedTime >= TOUCH_CONFIRM_ANSWER_WAIT_MS) {
+                touchConfirmInProgress = false
+                touchConfirmScheduled = false
+                waitingForTouchConfirm = false
+            }
             gyroManager.stopTracking()
             binding.overlayView.setDetections(emptyList(), 0, 0)
             binding.overlayView.setFrozen(false)
@@ -1517,25 +1610,45 @@ class HomeFragment : Fragment() {
         }
     }
 
+    /**
+     * 접촉 판정(Touch/Grab Detection) — 3중 조건이 모두 만족될 때만 true.
+     * 1) 렌즈 가림 필터: 손 박스가 화면 60% 이상이면 false.
+     * 2) 중심점/검지·엄지 끝 기반 교집합: 손 중심이 객체 안 / 객체 중심이 손 안 / 검지·엄지 끝이 객체 안.
+     * 3) 체공 시간(30프레임)은 호출부에서 touchFrameCount >= TOUCH_CONFIRM_FRAMES 로 강제.
+     */
     private fun isHandTouchingTargetBox(handsResult: HandLandmarkerResult?, targetBox: RectF, imageWidth: Int, imageHeight: Int): Boolean {
-        val landmarks = handsResult?.landmarks() ?: run { lastTouchMidpointPx = null; return false }
-        if (imageWidth <= 0 || imageHeight <= 0) { lastTouchMidpointPx = null; return false }
-        val hand = landmarks.firstOrNull() ?: run { lastTouchMidpointPx = null; return false }
-        if (hand.size < 9) { lastTouchMidpointPx = null; return false }
-        val thumb = landmarkToPoint(hand, 4, imageWidth, imageHeight) ?: run { lastTouchMidpointPx = null; return false }
-        val index = landmarkToPoint(hand, 8, imageWidth, imageHeight) ?: run { lastTouchMidpointPx = null; return false }
-        val midX = (thumb.first + index.first) / 2f
-        val midY = (thumb.second + index.second) / 2f
+        lastTouchMidpointPx = null
+        val landmarks = handsResult?.landmarks() ?: return false
+        if (imageWidth <= 0 || imageHeight <= 0) return false
+        val hand = landmarks.firstOrNull() ?: return false
+        if (hand.size < 9) return false
+
+        val handBox = handLandmarksToRect(hand, imageWidth, imageHeight)
+        val handW = handBox.width()
+        val handH = handBox.height()
+
+        // 1. 렌즈 가림 필터 (Anti-Occlusion by Size): 60% 이상이면 객체를 잡은 게 아니라 렌즈를 가린 것
+        if (handW >= imageWidth * 0.6f || handH >= imageHeight * 0.6f) return false
+
+        val handCenterX = handBox.centerX()
+        val handCenterY = handBox.centerY()
+        val objCenterX = targetBox.centerX()
+        val objCenterY = targetBox.centerY()
+        val thumb = landmarkToPoint(hand, 4, imageWidth, imageHeight)
+        val index = landmarkToPoint(hand, 8, imageWidth, imageHeight)
+        val midX = if (thumb != null && index != null) (thumb.first + index.first) / 2f else handCenterX
+        val midY = if (thumb != null && index != null) (thumb.second + index.second) / 2f else handCenterY
         lastTouchMidpointPx = Pair(midX, midY)
-        val w = targetBox.width().coerceAtLeast(1f)
-        val h = targetBox.height().coerceAtLeast(1f)
-        val touchBox = RectF(
-            targetBox.left - w * TOUCH_BOX_EXPAND_RATIO,
-            targetBox.top - h * TOUCH_BOX_EXPAND_RATIO,
-            targetBox.right + w * TOUCH_BOX_EXPAND_RATIO,
-            targetBox.bottom + h * TOUCH_BOX_EXPAND_RATIO
-        )
-        return touchBox.contains(midX, midY)
+
+        // 2. 중심점 기반 정밀 교집합 (Center-Biased): contains만 인정, 단순 intersects 미인정
+        val centerInObject = targetBox.contains(handCenterX, handCenterY)
+        val objectCenterInHand = handBox.contains(objCenterX, objCenterY)
+        val indexTipInObject = index != null && targetBox.contains(index.first, index.second)
+        val thumbTipInObject = thumb != null && targetBox.contains(thumb.first, thumb.second)
+        if (!centerInObject && !objectCenterInHand && !indexTipInObject && !thumbTipInObject) return false
+
+        // 1·2 통과. 3(연속 30프레임)은 호출부에서 touchFrameCount로 검사
+        return true
     }
 
     private fun landmarkToPoint(hand: List<NormalizedLandmark>, index: Int, imageWidth: Int, imageHeight: Int): Pair<Float, Float>? {
@@ -1741,7 +1854,9 @@ class HomeFragment : Fragment() {
                     if (handTouch) {
                         touchFrameCount++
                         releaseFrameCount = 0
-                        if (!touchActive && !touchConfirmInProgress && !touchConfirmScheduled && touchFrameCount >= TOUCH_CONFIRM_FRAMES) {
+                        val inBreathingRoom = voiceFlowController?.isInSttBreathingRoom() == true
+                        if (!touchActive && !touchConfirmInProgress && !touchConfirmScheduled &&
+                            touchFrameCount >= TOUCH_CONFIRM_FRAMES && !inBreathingRoom) {
                             touchActive = true
                             val nowMs = System.currentTimeMillis()
                             if (nowMs - lastTouchTtsTimeMs >= TOUCH_TTS_COOLDOWN_MS) {
