@@ -455,6 +455,7 @@ class HomeFragment : Fragment() {
                 requireActivity().runOnUiThread {
                     binding.userSpeechText.text = text
                     if (waitingForTouchConfirm) {
+                        Log.d("TouchConfirm", "onResult(터치확인): raw=\"$text\" normalized=\"${text.trim().lowercase().replace(" ", "")}\" → handleTouchConfirmYesNo 호출")
                         waitingForTouchConfirm = false
                         handleTouchConfirmYesNo(text)
                         return@runOnUiThread
@@ -496,6 +497,7 @@ class HomeFragment : Fragment() {
                         state == VoiceFlowController.VoiceFlowState.WAITING_CONFIRMATION
 
                     if (isNoMatchOrTimeout && isSttWaiting) {
+                        Log.d("TouchConfirm", "onErrorWithCode: NO_MATCH/타임아웃 waitingForTouchConfirm=$waitingForTouchConfirm errorCode=$errorCode msg=$msg")
                         val isTouchConfirm = waitingForTouchConfirm
                         val isVoiceConfirm = state == VoiceFlowController.VoiceFlowState.WAITING_CONFIRMATION
                         val retryCount = when {
@@ -583,7 +585,9 @@ class HomeFragment : Fragment() {
                 requireActivity().runOnUiThread {
                     if (text.isNotBlank()) binding.userSpeechText.text = text
                     if (text.isNullOrBlank()) return@runOnUiThread
-                    if (!isShortYesLike(text)) return@runOnUiThread
+                    val shortYes = isShortYesLike(text)
+                    Log.d("TouchConfirm", "onPartialResult: raw=\"$text\" isShortYesLike=$shortYes waitingForTouchConfirm=$waitingForTouchConfirm")
+                    if (!shortYes) return@runOnUiThread
                     val state = voiceFlowController?.currentState
                     val isConfirmWaiting = state == VoiceFlowController.VoiceFlowState.WAITING_CONFIRMATION
                     if (isConfirmWaiting || waitingForTouchConfirm) {
@@ -676,9 +680,14 @@ class HomeFragment : Fragment() {
 
     private fun isShortYesLike(text: String): Boolean {
         val t = text.trim().lowercase().replace(" ", "")
-        if (t.length > 6) return false
-        return t.contains("예") || t.contains("네") || t.contains("내") || t.contains("응") ||
+        if (t.length > 6) {
+            Log.d("TouchConfirm", "isShortYesLike: false (길이 초과) raw=\"$text\" t=\"$t\" len=${t.length}")
+            return false
+        }
+        val result = t.contains("예") || t.contains("네") || t.contains("내") || t.contains("응") ||
             t.contains("맞") || t.contains("그래") || t.contains("좋아") || t == "yes" || t == "y"
+        if (!result) Log.d("TouchConfirm", "isShortYesLike: false raw=\"$text\" t=\"$t\"")
+        return result
     }
 
     private fun handleTouchConfirmYesNo(text: String) {
@@ -687,6 +696,7 @@ class HomeFragment : Fragment() {
             t.contains("맞") || t.contains("그래") || t.contains("좋아") || t.contains("찾았") || t.contains("닿았") ||
             t == "yes" || t == "y"
         val isExplicitNo = t.contains("아니") || t.contains("아직") || t.contains("없어") || t.contains("못 찾") || t == "no" || t == "n"
+        Log.d("TouchConfirm", "handleTouchConfirmYesNo: raw=\"$text\" normalized=\"$t\" isYes=$isYes isExplicitNo=$isExplicitNo → ${if (isYes) "YES(종료)" else if (isExplicitNo) "NO(재탐지)" else "else(재시작)"}")
         when {
             isYes -> {
                 requireActivity().runOnUiThread {
@@ -697,8 +707,9 @@ class HomeFragment : Fragment() {
                     touchActive = false
                     touchFrameCount = 0
                     releaseFrameCount = 0
-                    speak(VoicePrompts.PROMPT_FOUND_AND_END, urgent = true, isAutoGuidance = false)
-                    performKillAllResetFromTouch()
+                    speak(VoicePrompts.PROMPT_FOUND_AND_END, urgent = true, isAutoGuidance = false) {
+                        requireActivity().runOnUiThread { performKillAllResetFromTouch() }
+                    }
                 }
             }
             isExplicitNo -> resetTouchConfirmAndRetrack()
@@ -767,6 +778,7 @@ class HomeFragment : Fragment() {
         touchConfirmScheduled = false
         waitingForTouchConfirm = true
         touchConfirmAskedTime = System.currentTimeMillis()
+        Log.d("TouchConfirm", "enterTouchConfirm: 터치 확인 시작, STT 곧 시작 (waitingForTouchConfirm=true)")
         touchConfirmSttRetryCount = 0
         vibrateFeedback()
         speak("상품에 닿았나요? 닿았으면 예라고 말해주세요.", urgent = true, isAutoGuidance = false) {
