@@ -164,6 +164,7 @@ class STTManager(
         }
 
         override fun onError(error: Int) {
+            Log.d(TAG, "onError: code=$error")
             val msg = when (error) {
                 SpeechRecognizer.ERROR_AUDIO -> "오디오 에러"
                 SpeechRecognizer.ERROR_CLIENT -> "클라이언트 에러"
@@ -196,6 +197,7 @@ class STTManager(
                 !lastPartialText.isNullOrBlank() -> lastPartialText
                 else -> null
             }
+            Log.d(TAG, "onResults: finalText=\"$finalText\" (from ${if (!text.isNullOrBlank()) "matches" else "lastPartial"})")
             if (!finalText.isNullOrBlank()) {
                 onResult(finalText)
                 lastPartialText = null
@@ -211,6 +213,7 @@ class STTManager(
             val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
             val text = matches?.firstOrNull()?.trim() ?: ""
             if (text.isNotBlank()) lastPartialText = text
+            Log.d(TAG, "onPartialResults: text=\"$text\"")
             onPartialResult?.invoke(text)
         }
 
