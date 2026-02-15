@@ -6,16 +6,16 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:background="@color/ivory_background">
+    android:background="?android:windowBackground">
 
     <com.google.android.material.appbar.MaterialToolbar
         android:id="@+id/toolbar"
         android:layout_width="match_parent"
         android:layout_height="?attr/actionBarSize"
-        android:background="@color/ivory_panel"
+        android:background="?attr/colorSurface"
         app:navigationIcon="@drawable/ic_arrow_back"
         app:title=""
-        app:titleTextColor="@color/text_primary" />
+        app:titleTextColor="?attr/colorOnSurface" />
 
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/recycler"

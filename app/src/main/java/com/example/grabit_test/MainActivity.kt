@@ -8,6 +8,8 @@ import android.os.Looper
 import android.view.KeyEvent
 import android.view.View
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.ViewModelProvider
 import androidx.navigation.fragment.NavHostFragment
 import androidx.navigation.ui.setupWithNavController
@@ -37,6 +39,7 @@ class MainActivity : AppCompatActivity() {
     private var currentLongPressedKeyCode = -1
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        ThemeHelper.applyTheme(this)
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
@@ -49,6 +52,13 @@ class MainActivity : AppCompatActivity() {
 
         binding.toolbar.title = "GrabIT"
         binding.bottomNavigation.setupWithNavController(navController)
+
+        // 상태바(상단) 인셋만 적용 — 툴바가 시계·알림과 겹치지 않도록 (하단 내비는 시스템 처리)
+        ViewCompat.setOnApplyWindowInsetsListener(binding.root) { view, windowInsets ->
+            val insets = windowInsets.getInsets(WindowInsetsCompat.Type.statusBars())
+            view.setPadding(insets.left, insets.top, insets.right, 0)
+            windowInsets
+        }
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {

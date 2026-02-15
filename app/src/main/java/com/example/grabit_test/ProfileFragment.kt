@@ -30,6 +30,13 @@ class ProfileFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
+        binding.themeSwitch.isChecked = ThemeHelper.isLightMode(requireContext())
+        binding.themeSwitch.setOnCheckedChangeListener { _, isChecked ->
+            ThemeHelper.setThemeMode(requireContext(), if (isChecked) ThemeHelper.MODE_LIGHT else ThemeHelper.MODE_DARK)
+            ThemeHelper.applyTheme(requireContext())
+            requireActivity().recreate()
+        }
+
         binding.btnFrequent.setOnClickListener {
             findNavController().navigate(
                 R.id.nav_search_history_detail,

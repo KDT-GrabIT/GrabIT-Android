@@ -26,7 +26,7 @@ class TTSManager(
     }
 
     private var textToSpeech: TextToSpeech? = null
-    private var isReady = false
+    private var engineReady = false
     private var pendingSpeakDoneCallback: (() -> Unit)? = null
     private val handler = Handler(Looper.getMainLooper())
     private var speakDoneTimeoutRunnable: Runnable? = null
@@ -53,7 +53,7 @@ class TTSManager(
                         onError("TTS 재생 오류")
                     }
                 })
-                isReady = true
+                engineReady = true
                 onReady()
                 callback(true)
             } else {
@@ -65,7 +65,7 @@ class TTSManager(
     }
 
     fun speak(text: String, queueMode: Int = TextToSpeech.QUEUE_FLUSH, onDone: (() -> Unit)? = null) {
-        if (!isReady || text.isBlank()) {
+        if (!engineReady || text.isBlank()) {
             Log.w(TAG, "speak: 준비되지 않았거나 텍스트가 비어있음")
             onDone?.invoke()
             return
@@ -108,6 +108,9 @@ class TTSManager(
 
     fun isSpeaking(): Boolean = textToSpeech?.isSpeaking == true
 
+    /** TTS 엔진 초기화 완료 여부 (speak 호출 가능 여부) */
+    fun isReady(): Boolean = engineReady
+
     fun release() {
         try {
             cancelSpeakDoneTimeout()
@@ -115,7 +118,7 @@ class TTSManager(
             textToSpeech?.stop()
             textToSpeech?.shutdown()
             textToSpeech = null
-            isReady = false
+            engineReady = false
         } catch (e: Exception) {
             Log.e(TAG, "release 실패", e)
         }

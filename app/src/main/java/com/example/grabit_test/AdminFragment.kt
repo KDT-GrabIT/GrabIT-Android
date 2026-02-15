@@ -69,7 +69,7 @@ class AdminFragment : Fragment() {
                 if (position == 0) return
                 val selected = classLabels.getOrNull(position - 1) ?: return
                 if (selected.isNotBlank()) {
-                    sharedViewModel.selectTargetFromAdmin(selected)
+                    sharedViewModel.selectTargetForSearch(selected)
                     findNavController().navigate(R.id.nav_home)
                 }
             }

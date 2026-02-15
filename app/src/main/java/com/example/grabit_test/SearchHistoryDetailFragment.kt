@@ -87,7 +87,7 @@ class SearchHistoryDetailFragment : Fragment() {
     }
 
     private fun navigateToHomeAndSearch(classLabel: String) {
-        sharedViewModel.selectTargetFromAdmin(classLabel)
+        sharedViewModel.selectTargetForSearch(classLabel)
         findNavController().navigate(R.id.nav_home)
     }
 

@@ -21,9 +21,6 @@ class VoiceFlowController(
         private const val TAG = "VoiceFlowController"
 
         // 안내 멘트
-        const val MSG_APP_START =
-            "쇼핑 보조가 시작되었습니다. 도움말이 필요하면 '도움말'이라고 말씀해주세요."
-
         const val MSG_ASK_PRODUCT = "찾으시는 상품을 말씀해주세요."
 
         const val MSG_HELP =
@@ -167,10 +164,13 @@ class VoiceFlowController(
         speak(VoicePrompts.PROMPT_TOUCH_RESTART)
     }
 
-    /** 확인/재입력 버튼 클릭 (접근성용 보조) */
+    /** 확인(예) 버튼 클릭: 맞으면 예와 동일하게 검색 시작 */
     fun onConfirmClicked() {
         if (currentState == VoiceFlowState.CONFIRM_PRODUCT || currentState == VoiceFlowState.WAITING_CONFIRMATION) {
-            resetToAppStartWithRestartPrompt()
+            transitionTo(VoiceFlowState.SEARCHING_PRODUCT)
+            val msg = msgSearching(currentProductName)
+            speak(msg)
+            onStartSearch(currentProductName)
         }
     }
 
