@@ -21,11 +21,15 @@ class VoiceFlowController(
         private const val TAG = "VoiceFlowController"
 
         // 안내 멘트
-        const val MSG_ASK_PRODUCT = "찾으시는 상품을 말씀해주세요."
+        const val MSG_ASK_PRODUCT = "찾으시는 상품을 말씀해주세요. 앱 사용방법은 도움말이라고 말씀해주세요."
 
         const val MSG_HELP =
-            "이 앱은 음성으로 상품을 찾아드립니다. 안내에 따라 상품 이름을 말씀하시고, 확인 질문에 예 또는 아니요로 답하시면 됩니다. " +
-            "'다시'라고 말씀하시면 마지막 안내를 다시 들으실 수 있습니다."
+            "홈 화면에서 시작하기 버튼을 누르거나, 볼륨 업 키를 길게 누르면 찾으시는 상품을 말씀해 달라는 안내가 나옵니다.\n\n" +
+            "상품 이름을 말하시면 맞는지 확인한 뒤, 예라고 하시거나 확인 버튼을 누르시면 찾기가 시작됩니다. 재입력 버튼으로 상품명을 다시 말할 수 있습니다.\n\n" +
+            "상품을 찾는 동안 방향과 거리 안내가 음성으로 나오고, 상품에 손을 뻗어 닿으시면 상품에 닿았나요라고 물어봅니다. 예라고 하시거나 예 버튼을 누르시면 안내가 종료됩니다.\n\n" +
+            "찾지 못했을 때는 다시 찾기 버튼으로 다시 시도할 수 있습니다.\n\n" +
+            "내 정보의 자주 찾는 상품, 최근 찾은 상품에서 항목을 누르면 해당 상품 찾기가 바로 시작됩니다.\n\n" +
+            "도움말이라고 말하시면 이 사용방법을 다시 들으실 수 있습니다."
 
         fun msgConfirmProduct(productName: String) =
             "찾으시는 상품이 ${productName} 맞습니까? 맞으면 '예'라고 말해주세요."
@@ -55,6 +59,10 @@ class VoiceFlowController(
     var currentState: VoiceFlowState = VoiceFlowState.APP_START
         private set
 
+    /** TTS 다음 단계가 음성 입력인지. 볼륨 다운 길게 누르기는 이 값이 true일 때만 TTS 스킵 후 STT 시작. */
+    var isNextStepVoiceInput: Boolean = false
+        private set
+
     private var lastSpokenText: String = ""
     private var currentProductName: String = ""
     /** STT 세션 종료 시각. 4초 이내에는 자동 탐지 TTS(거리/방향 안내) 무시용 */
@@ -73,6 +81,11 @@ class VoiceFlowController(
         }
     }
 
+    /** 볼륨 다운 길게 누르기: 상태 변경 없이 재생 중 TTS만 스킵하고 STT만 시작 */
+    fun requestSttOnly() {
+        onRequestStartStt()
+    }
+
     /** STT 결과 처리 */
     fun onSttResult(text: String) {
         val normalized = text.trim()
@@ -81,9 +94,14 @@ class VoiceFlowController(
         when (currentState) {
             VoiceFlowState.WAITING_PRODUCT_NAME -> handleProductNameReceived(normalized)
             VoiceFlowState.WAITING_CONFIRMATION -> handleConfirmationReceived(normalized)
-            VoiceFlowState.APP_START,
+            VoiceFlowState.APP_START -> {
+                if (isRepeatCommand(normalized)) repeatLast()
+                else if (isHelpCommand(normalized)) speakHelp()
+                else handleProductNameReceived(normalized)
+            }
             VoiceFlowState.CONFIRM_PRODUCT -> {
                 if (isRepeatCommand(normalized)) repeatLast()
+                else handleConfirmationReceived(normalized)
             }
             VoiceFlowState.SEARCHING_PRODUCT -> {
                 if (isRepeatCommand(normalized)) repeatLast()
@@ -270,6 +288,15 @@ class VoiceFlowController(
 
     private fun transitionTo(state: VoiceFlowState) {
         currentState = state
+        isNextStepVoiceInput = when (state) {
+            VoiceFlowState.WAITING_PRODUCT_NAME,
+            VoiceFlowState.CONFIRM_PRODUCT -> true
+            VoiceFlowState.APP_START,
+            VoiceFlowState.WAITING_CONFIRMATION,
+            VoiceFlowState.SEARCHING_PRODUCT,
+            VoiceFlowState.SEARCH_RESULT,
+            VoiceFlowState.SEARCH_FAILED -> false
+        }
         val stateLabel = when (state) {
             VoiceFlowState.APP_START -> "앱 시작"
             VoiceFlowState.WAITING_PRODUCT_NAME -> "상품명 입력 대기"

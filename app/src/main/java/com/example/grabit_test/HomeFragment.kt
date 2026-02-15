@@ -273,6 +273,13 @@ class HomeFragment : Fragment() {
             }
         }
 
+        sharedViewModel.volumeDownLongPressTrigger.observe(viewLifecycleOwner) { event ->
+            if (event != null) {
+                sharedViewModel.consumeVolumeDownLongPressTrigger()
+                onVolumeDownLongPress()
+            }
+        }
+
         if (allPermissionsGranted()) {
             startCamera()
             voiceFlowController?.start()
@@ -335,6 +342,28 @@ class HomeFragment : Fragment() {
         ttsManager?.stop()
         sttManager?.cancelListening()
         voiceFlowController?.startProductNameInput()
+    }
+
+    /** 볼륨 다운 길게 누르기: 스킵할 TTS가 있고 다음이 음성 입력일 때만 TTS 스킵 후 STT. (상품명 입력 대기, 상품 확인, 터치 확인만) */
+    private fun onVolumeDownLongPress() {
+        if (!allPermissionsGranted()) {
+            Toast.makeText(requireContext(), "마이크 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
+            requestPermissions(REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
+            return
+        }
+        val inTouchConfirm = waitingForTouchConfirm || touchConfirmInProgress
+        val canSkipToVoice = inTouchConfirm ||
+            (voiceFlowController != null && voiceFlowController!!.isNextStepVoiceInput)
+        if (!canSkipToVoice) return
+        if (!inTouchConfirm && voiceFlowController == null) return
+        pendingSearchTarget = null
+        ttsManager?.stop()
+        sttManager?.cancelListening()
+        if (inTouchConfirm) {
+            sttManager?.startListening()
+        } else {
+            voiceFlowController?.requestSttOnly()
+        }
     }
 
     /** pendingSearchTarget이 있으면 TTS 준비 시 탐지 시작(안내 TTS 포함). TTS 미준비 시 짧은 간격으로 재시도. */

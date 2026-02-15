@@ -33,7 +33,11 @@ class MainActivity : AppCompatActivity() {
         (window.decorView as? View)?.performHapticFeedback(
             android.view.HapticFeedbackConstants.LONG_PRESS
         )
-        sharedViewModel.triggerVolumeLongPress()
+        if (currentLongPressedKeyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+            sharedViewModel.triggerVolumeDownLongPress()
+        } else {
+            sharedViewModel.triggerVolumeLongPress()
+        }
     }
     private var isLongPressTriggered = false
     private var currentLongPressedKeyCode = -1

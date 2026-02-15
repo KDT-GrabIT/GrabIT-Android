@@ -25,7 +25,7 @@ class SharedViewModel : ViewModel() {
         _selectedSearchTarget.value = null
     }
 
-    /** 볼륨 키 롱프레스 시 음성 인식 등 실행 요청. MainActivity가 호출, HomeFragment가 구독 */
+    /** 볼륨 업(등) 롱프레스: 시작하기와 동일 (TTS 후 STT). MainActivity가 호출, HomeFragment가 구독 */
     private val _volumeLongPressTrigger = MutableLiveData<Unit?>(null)
     val volumeLongPressTrigger: LiveData<Unit?> = _volumeLongPressTrigger
 
@@ -35,5 +35,17 @@ class SharedViewModel : ViewModel() {
 
     fun consumeVolumeLongPressTrigger() {
         _volumeLongPressTrigger.value = null
+    }
+
+    /** 볼륨 다운 롱프레스: TTS 생략 후 바로 STT 시작. MainActivity가 호출, HomeFragment가 구독 */
+    private val _volumeDownLongPressTrigger = MutableLiveData<Unit?>(null)
+    val volumeDownLongPressTrigger: LiveData<Unit?> = _volumeDownLongPressTrigger
+
+    fun triggerVolumeDownLongPress() {
+        _volumeDownLongPressTrigger.value = Unit
+    }
+
+    fun consumeVolumeDownLongPressTrigger() {
+        _volumeDownLongPressTrigger.value = null
     }
 }
