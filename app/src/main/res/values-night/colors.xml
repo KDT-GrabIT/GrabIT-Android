@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ========== GrabITApp_Final.jsx 다크 모드 기준 ========== -->
+    <!-- Background: #0B1220 / Surface: #111A2E / 텍스트: #E5E7EB, #94A3B8 / 악센트: #AEC3D0 / 올리브: #98995A -->
+
+    <!-- Primary: JSX 메인 악센트 (버튼·테두리·아이콘) -->
+    <color name="md_primary">#FFAEC3D0</color>
+    <color name="md_on_primary">#FF0B1220</color>
+    <color name="md_primary_container">#FF111A2E</color>
+    <color name="md_on_primary_container">#FFAEC3D0</color>
+
+    <!-- Secondary: 보조 텍스트/요소 (#94A3B8) -->
+    <color name="md_secondary">#FF94A3B8</color>
+    <color name="md_on_secondary">#FF0B1220</color>
+    <color name="md_secondary_container">#FF111A2E</color>
+    <color name="md_on_secondary_container">#FF94A3B8</color>
+
+    <!-- Tertiary: 올리브 강조 (#98995A, 예 버튼 등) -->
+    <color name="md_tertiary">#FF98995A</color>
+    <color name="md_on_tertiary">#FF0B1220</color>
+    <color name="md_tertiary_container">#FF111A2E</color>
+    <color name="md_on_tertiary_container">#FF98995A</color>
+
+    <!-- Background / Surface (JSX #0B1220, #111A2E) -->
+    <color name="md_background">#FF0B1220</color>
+    <color name="md_on_background">#FFE5E7EB</color>
+    <color name="md_surface">#FF111A2E</color>
+    <color name="md_on_surface">#FFE5E7EB</color>
+    <color name="md_surface_variant">#FF111A2E</color>
+    <color name="md_on_surface_variant">#FF94A3B8</color>
+
+    <!-- Error -->
+    <color name="md_error">#FFF87171</color>
+    <color name="md_on_error">#FF450A0A</color>
+    <color name="md_error_container">#FF7F1D1D</color>
+    <color name="md_on_error_container">#FFFECACA</color>
+
+    <!-- Outline (JSX border #111A2E) -->
+    <color name="md_outline">#FF111A2E</color>
+    <color name="md_outline_variant">#FF111A2E</color>
+
+    <!-- ========== 기존 theme_* 매핑 (JSX와 동일) ========== -->
+    <color name="theme_background">@color/md_background</color>
+    <color name="theme_surface">@color/md_surface</color>
+    <color name="theme_surface_variant">@color/md_surface_variant</color>
+    <color name="theme_border">@color/md_outline</color>
+    <color name="theme_text_primary">@color/md_on_surface</color>
+    <color name="theme_text_secondary">@color/md_on_surface_variant</color>
+    <color name="theme_accent">@color/md_primary</color>
+    <color name="theme_accent_green">@color/md_tertiary</color>
+
+    <color name="status_bar">@color/md_surface</color>
+    <color name="text_primary">@color/md_on_surface</color>
+    <color name="text_secondary">@color/md_on_surface_variant</color>
+</resources>

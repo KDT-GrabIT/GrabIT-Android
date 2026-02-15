@@ -159,6 +159,10 @@ class HomeFragment : Fragment() {
     private val POSITION_ANNOUNCE_INTERVAL_MS = 5000L
     private var positionAnnounceRunnable: Runnable? = null
     private var voiceSearchTargetLabel: String? = null
+    /** 마이페이지/관리자에서 상품 선택 후 홈 진입 시, TTS 준비되면 재생·탐지 (TTS 비동기 초기화 대응) */
+    private var pendingSearchTarget: String? = null
+    private val PENDING_SEARCH_TARGET_MAX_WAIT_MS = 8000L
+    private var pendingSearchTargetPostTime = 0L
 
     private val REQUIRED_PERMISSIONS = arrayOf(
         Manifest.permission.CAMERA,
@@ -232,16 +236,33 @@ class HomeFragment : Fragment() {
         initGyroTrackingManager()
         initSttTts()
 
-        binding.voiceInputButton.setOnClickListener { onVoiceInputClicked() }
-        binding.confirmBtn.setOnClickListener { voiceFlowController?.onConfirmClicked() }
-        binding.reinputBtn.setOnClickListener { voiceFlowController?.onReinputClicked() }
+        binding.confirmBtn.setOnClickListener {
+            if (waitingForTouchConfirm || touchConfirmInProgress) {
+                handleTouchConfirmYesNo("예")
+            } else {
+                voiceFlowController?.onConfirmClicked()
+            }
+        }
+        binding.reinputBtn.setOnClickListener {
+            if (waitingForTouchConfirm || touchConfirmInProgress) {
+                handleTouchConfirmYesNo("아니오")
+            } else {
+                voiceFlowController?.onReinputClicked()
+            }
+        }
         binding.retryBtn.setOnClickListener { voiceFlowController?.onRetrySearch() }
+        binding.startButton.setOnClickListener {
+            binding.startOverlay.visibility = View.GONE
+            onVoiceInputClicked()
+        }
         setupPinchZoom()
 
-        sharedViewModel.adminSelectedTarget.observe(viewLifecycleOwner) { target ->
+        sharedViewModel.selectedSearchTarget.observe(viewLifecycleOwner) { target ->
             target?.let {
-                sharedViewModel.consumeAdminSelectedTarget()
-                startDetectionFromAdmin(it)
+                sharedViewModel.consumeSelectedSearchTarget()
+                pendingSearchTarget = it
+                pendingSearchTargetPostTime = System.currentTimeMillis()
+                tryStartDetectionWithPendingTarget()
             }
         }
 
@@ -249,6 +270,13 @@ class HomeFragment : Fragment() {
             if (event != null) {
                 sharedViewModel.consumeVolumeLongPressTrigger()
                 onVoiceInputClicked()
+            }
+        }
+
+        sharedViewModel.volumeDownLongPressTrigger.observe(viewLifecycleOwner) { event ->
+            if (event != null) {
+                sharedViewModel.consumeVolumeDownLongPressTrigger()
+                onVolumeDownLongPress()
             }
         }
 
@@ -301,6 +329,7 @@ class HomeFragment : Fragment() {
     }
 
     private fun onVoiceInputClicked() {
+        pendingSearchTarget = null
         if (!allPermissionsGranted()) {
             Toast.makeText(requireContext(), "마이크 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
             requestPermissions(REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
@@ -315,17 +344,69 @@ class HomeFragment : Fragment() {
         voiceFlowController?.startProductNameInput()
     }
 
-    private fun startDetectionFromAdmin(targetLabel: String) {
+    /** 볼륨 다운 길게 누르기: 스킵할 TTS가 있고 다음이 음성 입력일 때만 TTS 스킵 후 STT. (상품명 입력 대기, 상품 확인, 터치 확인만) */
+    private fun onVolumeDownLongPress() {
+        if (!allPermissionsGranted()) {
+            Toast.makeText(requireContext(), "마이크 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
+            requestPermissions(REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
+            return
+        }
+        val inTouchConfirm = waitingForTouchConfirm || touchConfirmInProgress
+        val canSkipToVoice = inTouchConfirm ||
+            (voiceFlowController != null && voiceFlowController!!.isNextStepVoiceInput)
+        if (!canSkipToVoice) return
+        if (!inTouchConfirm && voiceFlowController == null) return
+        pendingSearchTarget = null
+        ttsManager?.stop()
+        sttManager?.cancelListening()
+        if (inTouchConfirm) {
+            sttManager?.startListening()
+        } else {
+            voiceFlowController?.requestSttOnly()
+        }
+    }
+
+    /** pendingSearchTarget이 있으면 TTS 준비 시 탐지 시작(안내 TTS 포함). TTS 미준비 시 짧은 간격으로 재시도. */
+    private fun tryStartDetectionWithPendingTarget() {
+        if (_binding == null || !isAdded) {
+            pendingSearchTarget = null
+            return
+        }
+        val target = pendingSearchTarget ?: return
+        if (ttsManager?.isReady() == true) {
+            pendingSearchTarget = null
+            startDetectionWithTarget(target)
+            return
+        }
+        if (System.currentTimeMillis() - pendingSearchTargetPostTime > PENDING_SEARCH_TARGET_MAX_WAIT_MS) {
+            pendingSearchTarget = null
+            requireActivity().runOnUiThread {
+                _binding?.startOverlay?.visibility = View.GONE
+                startScanningDirect(target)
+            }
+            val displayName = if (ProductDictionary.isLoaded()) ProductDictionary.getDisplayNameKo(target) else target
+            viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
+                val repo = SearchHistoryRepository(AppDatabase.getInstance(requireContext().applicationContext))
+                repo.insert(SearchHistoryItem(query = displayName, classLabel = target, searchedAt = System.currentTimeMillis(), source = "selection"))
+            }
+            return
+        }
+        _binding?.root?.postDelayed({ tryStartDetectionWithPendingTarget() }, 250)
+    }
+
+    /** 관리자 탭 또는 마이페이지(자주/최근 찾은 상품)에서 상품 선택 시 탐지 시작 */
+    private fun startDetectionWithTarget(targetLabel: String) {
         currentTargetLabel.set(targetLabel)
         val displayName = if (ProductDictionary.isLoaded()) ProductDictionary.getDisplayNameKo(targetLabel) else targetLabel
         requireActivity().runOnUiThread {
-            binding.systemMessageText.text = "찾는 중: $displayName"
+            _binding?.startOverlay?.visibility = View.GONE
+            speak(VoiceFlowController.msgSearching(displayName), urgent = true, isAutoGuidance = false)
             startScanningDirect(targetLabel)
         }
         // 검색 이력: 찾고 싶은 상품을 선택한 시점에 한 번만 저장
         viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
             val repo = SearchHistoryRepository(AppDatabase.getInstance(requireContext().applicationContext))
-            repo.insert(SearchHistoryItem(query = displayName, classLabel = targetLabel, searchedAt = System.currentTimeMillis(), source = "admin"))
+            repo.insert(SearchHistoryItem(query = displayName, classLabel = targetLabel, searchedAt = System.currentTimeMillis(), source = "selection"))
         }
     }
 
@@ -340,15 +421,14 @@ class HomeFragment : Fragment() {
     }
 
     private fun updateVoiceButtonVisibility() {
-        val listening = sttManager?.isListening() == true
-        val hasTarget = getTargetLabel().isNotEmpty()
-        val inSearchMode = hasTarget && (searchState == SearchState.SEARCHING || searchState == SearchState.LOCKED)
-        val showButton = !listening && !inSearchMode
-        binding.voiceButtonArea.visibility = if (showButton) View.VISIBLE else View.GONE
+        // 음성 입력/시스템 메시지 패널 제거로 별도 처리 없음
     }
 
     /** 완전 무결점 초기화(Kill-All Reset). 탭 전환·TOUCH_CONFIRM 긍정 종료 시 호출. */
     private fun resetGlobalState() {
+        pendingSearchTarget = null
+        pendingSearchTargetPostTime = 0L
+        _binding?.startOverlay?.visibility = View.VISIBLE
         camera?.cameraControl?.setZoomRatio(1.0f)
         currentZoomRatio = 1.0f
         searchState = SearchState.IDLE
@@ -401,9 +481,6 @@ class HomeFragment : Fragment() {
         _binding?.let { b ->
             b.overlayView.setDetections(emptyList(), 0, 0)
             b.overlayView.setFrozen(false)
-            b.searchTargetLabel.visibility = View.GONE
-            b.systemMessageText.text = ""
-            b.userSpeechText.text = ""
             b.voiceFlowButtons.visibility = View.GONE
             updateVoiceButtonVisibility()
         }
@@ -438,13 +515,13 @@ class HomeFragment : Fragment() {
                     voiceFlowController = VoiceFlowController(
                         ttsManager = ttsManager!!,
                         onStateChanged = { _, _ -> requireActivity().runOnUiThread { updateVoiceFlowButtons(); updateVoiceButtonVisibility() } },
-                        onSystemAnnounce = { msg -> requireActivity().runOnUiThread { binding.systemMessageText.text = msg } },
+                        onSystemAnnounce = { },
                         onRequestStartStt = { requireActivity().runOnUiThread { sttManager?.startListening() } },
                         onStartSearch = { productName -> requireActivity().runOnUiThread { onStartSearchFromVoiceFlow(productName) } },
                         onProductNameEntered = { productName -> requireActivity().runOnUiThread { setTargetFromSpokenProductName(productName) } }
                     )
                     voiceFlowController?.start()
-                    speak(VoiceFlowController.MSG_APP_START, urgent = true, isAutoGuidance = false)
+                    tryStartDetectionWithPendingTarget()
                 }
             }
         }
@@ -453,7 +530,6 @@ class HomeFragment : Fragment() {
             context = requireContext(),
             onResult = { text ->
                 requireActivity().runOnUiThread {
-                    binding.userSpeechText.text = text
                     if (waitingForTouchConfirm) {
                         Log.d("TouchConfirm", "onResult(터치확인): raw=\"$text\" normalized=\"${text.trim().lowercase().replace(" ", "")}\" → handleTouchConfirmYesNo 호출")
                         waitingForTouchConfirm = false
@@ -470,11 +546,9 @@ class HomeFragment : Fragment() {
             },
             onError = { msg ->
                 requireActivity().runOnUiThread {
-                    binding.systemMessageText.text = msg
                     if (waitingForTouchConfirm) {
                         if (System.currentTimeMillis() - touchConfirmAskedTime >= TOUCH_CONFIRM_ANSWER_WAIT_MS) {
                             waitingForTouchConfirm = false
-                            binding.systemMessageText.text = "손을 뻗어 잡아주세요"
                             touchActive = false
                             startPositionAnnounce()
                             Toast.makeText(requireContext(), "음성 인식 실패. 다시 시도해주세요.", Toast.LENGTH_SHORT).show()
@@ -517,7 +591,6 @@ class HomeFragment : Fragment() {
                             }, 400L)
                             return@runOnUiThread
                         }
-                        binding.systemMessageText.text = "음성 인식 실패: $msg (코드 $errorCode)"
                         if (retryCount < STT_MAX_RETRIES) {
                             if (isTouchConfirm) touchConfirmSttRetryCount++ else voiceFlowSttRetryCount++
                             speak("$msg") {
@@ -537,7 +610,6 @@ class HomeFragment : Fragment() {
                                 }
                                 touchConfirmSttRetryCount = 0
                                 waitingForTouchConfirm = false
-                                binding.systemMessageText.text = "손을 뻗어 잡아주세요"
                                 touchActive = false
                                 startPositionAnnounce()
                             } else {
@@ -565,25 +637,15 @@ class HomeFragment : Fragment() {
                     val isVoiceFlowWaiting = state == VoiceFlowController.VoiceFlowState.WAITING_PRODUCT_NAME ||
                         state == VoiceFlowController.VoiceFlowState.WAITING_CONFIRMATION
                     if (isRetryable && isVoiceFlowWaiting) {
-                        binding.systemMessageText.text = "다시 듣는 중..."
                         view?.postDelayed({ sttManager?.startListening() }, 800L)
                     }
                 }
             },
-            onListeningChanged = { listening ->
-                requireActivity().runOnUiThread {
-                    if (listening) {
-                        binding.systemMessageText.text = "듣는 중..."
-                        binding.userSpeechText.text = ""
-                    } else if (binding.systemMessageText.text == "듣는 중...") {
-                        binding.systemMessageText.text = ""
-                    }
-                    updateVoiceButtonVisibility()
-                }
+            onListeningChanged = { _ ->
+                requireActivity().runOnUiThread { updateVoiceButtonVisibility() }
             },
             onPartialResult = { text ->
                 requireActivity().runOnUiThread {
-                    if (text.isNotBlank()) binding.userSpeechText.text = text
                     if (text.isNullOrBlank()) return@runOnUiThread
                     val shortYes = isShortYesLike(text)
                     Log.d("TouchConfirm", "onPartialResult: raw=\"$text\" isShortYesLike=$shortYes waitingForTouchConfirm=$waitingForTouchConfirm")
@@ -609,28 +671,54 @@ class HomeFragment : Fragment() {
     }
 
     private fun updateVoiceFlowButtons() {
-        val state = voiceFlowController?.currentState ?: return
+        // 터치 확인 단계(상품에 닿았나요?): 예 / 아니오 버튼 표시
+        if (waitingForTouchConfirm || touchConfirmInProgress) {
+            binding.startOverlay.visibility = View.GONE
+            binding.voiceFlowButtons.visibility = View.VISIBLE
+            binding.confirmBtn.text = "예"
+            binding.reinputBtn.text = "아니오"
+            binding.confirmBtn.visibility = View.VISIBLE
+            binding.reinputBtn.visibility = View.VISIBLE
+            binding.retryBtn.visibility = View.GONE
+            return
+        }
+
+        val state = voiceFlowController?.currentState ?: run {
+            binding.voiceFlowButtons.visibility = View.GONE
+            return
+        }
+        binding.confirmBtn.text = "확인"
+        binding.reinputBtn.text = "재입력"
         when (state) {
             VoiceFlowController.VoiceFlowState.CONFIRM_PRODUCT,
             VoiceFlowController.VoiceFlowState.WAITING_CONFIRMATION -> {
+                binding.startOverlay.visibility = View.GONE
                 binding.voiceFlowButtons.visibility = View.VISIBLE
                 binding.confirmBtn.visibility = View.VISIBLE
                 binding.reinputBtn.visibility = View.VISIBLE
                 binding.retryBtn.visibility = View.GONE
             }
             VoiceFlowController.VoiceFlowState.SEARCH_RESULT -> {
+                binding.startOverlay.visibility = View.GONE
                 binding.voiceFlowButtons.visibility = View.VISIBLE
                 binding.confirmBtn.visibility = View.GONE
                 binding.reinputBtn.visibility = View.GONE
                 binding.retryBtn.visibility = View.VISIBLE
             }
             VoiceFlowController.VoiceFlowState.SEARCH_FAILED -> {
+                binding.startOverlay.visibility = View.GONE
                 binding.voiceFlowButtons.visibility = View.VISIBLE
                 binding.confirmBtn.visibility = View.GONE
                 binding.reinputBtn.visibility = View.GONE
                 binding.retryBtn.visibility = View.VISIBLE
             }
+            VoiceFlowController.VoiceFlowState.APP_START -> {
+                // 검색 중(자주/최근 찾은 상품에서 진입)이면 시작 버튼 숨김
+                binding.startOverlay.visibility = if (searchState == SearchState.SEARCHING) View.GONE else View.VISIBLE
+                binding.voiceFlowButtons.visibility = View.GONE
+            }
             else -> {
+                binding.startOverlay.visibility = View.GONE
                 binding.voiceFlowButtons.visibility = View.GONE
             }
         }
@@ -641,7 +729,6 @@ class HomeFragment : Fragment() {
         if (productName.isNotBlank() && targetClass.isBlank()) {
             voiceSearchTargetLabel = null
             val failReason = "인식된 말을 상품 목록에서 찾지 못했어요. '$productName'"
-            binding.systemMessageText.text = "상품 매칭 실패: '$productName'(을)를 찾지 못했어요."
             speak(failReason) { speak(VoicePrompts.PROMPT_PRODUCT_RECOGNITION_FAILED) { } }
             return
         }
@@ -649,7 +736,6 @@ class HomeFragment : Fragment() {
         transitionToSearching(isNewSearchSession = true)
         voiceSearchTargetLabel = targetClass
         currentTargetLabel.set(targetClass)
-        binding.systemMessageText.text = "찾는 중: ${getTargetLabel()}"
         startCamera()
         startSearchTimeout()
         updateVoiceButtonVisibility()
@@ -707,6 +793,7 @@ class HomeFragment : Fragment() {
                     touchActive = false
                     touchFrameCount = 0
                     releaseFrameCount = 0
+                    updateVoiceFlowButtons()
                     speak(VoicePrompts.PROMPT_FOUND_AND_END, urgent = true, isAutoGuidance = false) {
                         requireActivity().runOnUiThread { performKillAllResetFromTouch() }
                     }
@@ -714,7 +801,12 @@ class HomeFragment : Fragment() {
             }
             isExplicitNo -> resetTouchConfirmAndRetrack()
             else -> speak(VoicePrompts.PROMPT_TOUCH_RESTART, urgent = true, isAutoGuidance = false) {
-                requireActivity().runOnUiThread { performKillAllResetFromTouch() }
+                requireActivity().runOnUiThread {
+                    touchConfirmInProgress = false
+                    waitingForTouchConfirm = false
+                    updateVoiceFlowButtons()
+                    performKillAllResetFromTouch()
+                }
             }
         }
     }
@@ -729,8 +821,8 @@ class HomeFragment : Fragment() {
         _binding?.overlayView?.setDetections(emptyList(), 0, 0)
         _binding?.overlayView?.setFrozen(false)
         updateSearchTargetLabel()
+        updateVoiceFlowButtons()
         updateVoiceButtonVisibility()
-        binding.systemMessageText.text = ""
         startCamera()
     }
 
@@ -746,11 +838,11 @@ class HomeFragment : Fragment() {
             releaseFrameCount = 0
             closeDistanceFrameCount = 0
             missedFramesCount = 0
+            updateVoiceFlowButtons()
             voiceFlowController?.notifySttEnded()
             speak("다시 위치를 확인합니다.", urgent = true, isAutoGuidance = false) {
                 requireActivity().runOnUiThread {
                     startPositionAnnounce()
-                    binding.systemMessageText.text = "손을 뻗어 잡아주세요"
                 }
             }
         }
@@ -781,6 +873,7 @@ class HomeFragment : Fragment() {
         Log.d("TouchConfirm", "enterTouchConfirm: 터치 확인 시작, STT 곧 시작 (waitingForTouchConfirm=true)")
         touchConfirmSttRetryCount = 0
         vibrateFeedback()
+        requireActivity().runOnUiThread { updateVoiceFlowButtons() }
         speak("상품에 닿았나요? 닿았으면 예라고 말해주세요.", urgent = true, isAutoGuidance = false) {
             requireActivity().runOnUiThread { sttManager?.startListening() }
         }
@@ -891,14 +984,7 @@ class HomeFragment : Fragment() {
     private fun getTargetLabel(): String = currentTargetLabel.get().trim()
 
     private fun updateSearchTargetLabel() {
-        val label = getTargetLabel()
-        if (label.isEmpty()) {
-            binding.searchTargetLabel.visibility = View.GONE
-        } else {
-            val displayName = if (ProductDictionary.isLoaded()) ProductDictionary.getDisplayNameKo(label) else label
-            binding.searchTargetLabel.text = "찾는 품목: $displayName"
-            binding.searchTargetLabel.visibility = View.VISIBLE
-        }
+        // 검색 타겟 라벨 UI 제거로 별도 처리 없음
     }
 
     private fun hasSpecificTarget(): Boolean = getTargetLabel().isNotEmpty()
@@ -1252,7 +1338,6 @@ class HomeFragment : Fragment() {
             val percent = (box.confidence * 100).toInt().coerceIn(0, 100)
             val actualLabel = actualPrimaryLabel ?: box.label
             val fromVoice = voiceFlowController?.currentState == VoiceFlowController.VoiceFlowState.SEARCHING_PRODUCT
-            binding.systemMessageText.text = "객체 탐지됨 (${percent}%). 손을 뻗어 잡아주세요."
             val searchDurationMs = System.currentTimeMillis() - lastTimeEnteredSearchingMs
             val shouldAnnounceDetected = !hasAnnouncedDetectedThisSearchSession ||
                 searchDurationMs >= MIN_SEARCH_DURATION_BEFORE_DETECTED_TTS_MS
@@ -1260,7 +1345,8 @@ class HomeFragment : Fragment() {
                 ttsDetectedPlayed = true
                 hasAnnouncedDetectedThisSearchSession = true
                 vibrateFeedback()
-                speak("객체를 ${percent}% 확률로 탐지했습니다. 손을 뻗어 잡아주세요.")
+                val displayName = if (ProductDictionary.isLoaded()) ProductDictionary.getDisplayNameKo(actualLabel) else actualLabel
+                speak("${displayName}를 ${percent}% 확률로 찾았습니다. 손을 뻗어 잡아주세요.")
             }
             if (fromVoice) {
                 val requested = voiceSearchTargetLabel
@@ -1318,7 +1404,6 @@ class HomeFragment : Fragment() {
             binding.overlayView.setDetections(emptyList(), 0, 0)
             binding.overlayView.setFrozen(false)
             updateSearchTargetLabel()
-            binding.systemMessageText.text = "찾는 중: ${getTargetLabel()}"
             stopHandGuidanceTTS()
             startScanning()
             updateVoiceButtonVisibility()
@@ -1377,17 +1462,17 @@ class HomeFragment : Fragment() {
                 gpuDelegate = GpuDelegate()
                 options.addDelegate(gpuDelegate)
                 options.setAllowFp16PrecisionForFp32(true)
-                requireActivity().runOnUiThread { binding.systemMessageText.text = "YOLOX GPU 준비" }
+                requireActivity().runOnUiThread { }
             } catch (e: Exception) {
                 Log.e(TAG, "GPU 실패 -> CPU 전환", e)
                 options.setNumThreads(4)
                 gpuDelegate = null
-                requireActivity().runOnUiThread { binding.systemMessageText.text = "YOLOX CPU 준비" }
+                requireActivity().runOnUiThread { }
             }
             yoloxInterpreter = Interpreter(modelFile, options)
         } catch (e: Exception) {
             Log.e(TAG, "YOLOX 초기화 실패", e)
-            requireActivity().runOnUiThread { binding.systemMessageText.text = "YOLOX 초기화 실패" }
+            requireActivity().runOnUiThread { }
         }
     }
 
@@ -1784,18 +1869,9 @@ class HomeFragment : Fragment() {
                 _binding?.overlayView?.setTouchDebugPoint(null, null)
             }
             when (searchState) {
-                SearchState.IDLE -> binding.systemMessageText.text = ""
-                SearchState.SEARCHING -> binding.systemMessageText.text = "찾는 중: ${getTargetLabel()}"
-                SearchState.LOCKED -> {
-                    if (frozenBox != null) {
-                        binding.systemMessageText.text = when {
-                            waitingForTouchConfirm && (sttManager?.isListening() == true) -> "듣는 중..."
-                            waitingForTouchConfirm -> "상품에 닿았나요? 예라고 말해주세요."
-                            touchActive -> "손이 제품에 닿았어요"
-                            else -> "손을 뻗어 잡아주세요"
-                        }
-                    }
-                }
+                SearchState.IDLE -> { }
+                SearchState.SEARCHING -> { }
+                SearchState.LOCKED -> { }
             }
         }
     }

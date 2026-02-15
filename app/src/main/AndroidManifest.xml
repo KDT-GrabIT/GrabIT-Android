@@ -16,7 +16,7 @@
         android:label="GrabIT Test"
         android:hardwareAccelerated="true"
         android:usesCleartextTraffic="true"
-        android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+        android:theme="@style/Theme.GrabIT_Test">
 
         <activity
             android:name=".MainActivity"

@@ -1,16 +1,67 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- 기본 -->
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
 
-    <!-- 아이보리 테마 -->
+    <!-- ========== Material 3 GrabIT 라이트 (저채도·세련·눈 편함) ========== -->
+    <!-- Primary: Muted Teal (신뢰·테크) -->
+    <color name="md_primary">#FF0F766E</color>
+    <color name="md_on_primary">#FFF0FDFA</color>
+    <color name="md_primary_container">#FFCCFBF1</color>
+    <color name="md_on_primary_container">#FF134E4A</color>
+
+    <!-- Secondary: Slate -->
+    <color name="md_secondary">#FF475569</color>
+    <color name="md_on_secondary">#FFF8FAFC</color>
+    <color name="md_secondary_container">#FFE2E8F0</color>
+    <color name="md_on_secondary_container">#FF1E293B</color>
+
+    <!-- Tertiary: 보조 강조 -->
+    <color name="md_tertiary">#FF64748B</color>
+    <color name="md_on_tertiary">#FFF8FAFC</color>
+    <color name="md_tertiary_container">#FFE2E8F0</color>
+    <color name="md_on_tertiary_container">#FF334155</color>
+
+    <!-- Background / Surface (Stone·Slate 기반) -->
+    <color name="md_background">#FFFAFAF9</color>
+    <color name="md_on_background">#FF1C1917</color>
+    <color name="md_surface">#FFFFFFFF</color>
+    <color name="md_on_surface">#FF1C1917</color>
+    <color name="md_surface_variant">#FFF5F5F4</color>
+    <color name="md_on_surface_variant">#FF57534E</color>
+
+    <!-- Error -->
+    <color name="md_error">#FFB91C1C</color>
+    <color name="md_on_error">#FFFEF2F2</color>
+    <color name="md_error_container">#FFFEE2E2</color>
+    <color name="md_on_error_container">#FF450A0A</color>
+
+    <!-- Outline -->
+    <color name="md_outline">#FFD6D3D1</color>
+    <color name="md_outline_variant">#FFE7E5E4</color>
+
+    <!-- ========== 기존 theme_* 매핑 (교체 가능) ========== -->
+    <color name="theme_background">@color/md_background</color>
+    <color name="theme_surface">@color/md_surface</color>
+    <color name="theme_surface_variant">@color/md_surface_variant</color>
+    <color name="theme_border">@color/md_outline</color>
+    <color name="theme_text_primary">@color/md_on_surface</color>
+    <color name="theme_text_secondary">@color/md_on_surface_variant</color>
+    <color name="theme_accent">@color/md_primary</color>
+    <color name="theme_accent_green">@color/md_primary</color>
+
+    <!-- 상태바 (라이트: 어두운 아이콘) -->
+    <color name="status_bar">@color/md_surface</color>
+
+    <!-- 레거시 (필요 시 유지) -->
+    <color name="text_primary">@color/md_on_surface</color>
+    <color name="text_secondary">@color/md_on_surface_variant</color>
     <color name="ivory_background">#FFFBF7</color>
-    <color name="ivory_panel">#F5EFE6</color>
-    <color name="ivory_card">#F0EAE0</color>
-    <color name="ivory_divider">#E5DED4</color>
-    <color name="text_primary">#3D3632</color>
-    <color name="text_secondary">#5C5348</color>
-    <color name="accent_warm">#8B7355</color>
-    <color name="accent_warm_light">#A89078</color>
-    <color name="overlay_ivory">#22E5DED4</color>
+    <color name="ivory_panel">#FFF5F5F4</color>
+    <color name="ivory_card">#FFF0F0F0</color>
+    <color name="ivory_divider">#FFE7E5E4</color>
+    <color name="accent_warm">#FF475569</color>
+    <color name="accent_warm_light">#FF64748B</color>
+    <color name="overlay_ivory">#22E7E5E4</color>
 </resources>
