@@ -5,10 +5,6 @@
         android:icon="@drawable/ic_home"
         android:title="홈" />
     <item
-        android:id="@+id/nav_admin"
-        android:icon="@drawable/ic_admin"
-        android:title="관리자" />
-    <item
         android:id="@+id/nav_profile"
         android:icon="@drawable/ic_person"
         android:title="내 정보" />
