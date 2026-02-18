@@ -42,6 +42,7 @@ import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -420,6 +421,7 @@ class HomeFragment : Fragment() {
      * @param isAutoGuidance true면 STT 대화 직후 4초 breathing room 동안 무시(Drop).
      * onDone은 마지막 인자로 두어 trailing lambda 사용 가능. */
     private fun speak(text: String, urgent: Boolean = true, isAutoGuidance: Boolean = true, onDone: (() -> Unit)? = null) {
+        if (!viewLifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return
         if (isAutoGuidance && (voiceFlowController?.isInSttBreathingRoom() == true)) return
         if (!urgent && (ttsManager?.isSpeaking() == true)) return
         if (!urgent && (waitingForTouchConfirm || touchConfirmInProgress || (sttManager?.isListening() == true))) return
@@ -719,8 +721,8 @@ class HomeFragment : Fragment() {
                 binding.retryBtn.visibility = View.VISIBLE
             }
             VoiceFlowController.VoiceFlowState.APP_START -> {
-                // 검색 중(자주/최근 찾은 상품에서 진입)이면 시작 버튼 숨김
-                binding.startOverlay.visibility = if (searchState == SearchState.SEARCHING) View.GONE else View.VISIBLE
+                // 검색 중 또는 타겟 락(닿았나요? 아니오 후 재탐지) 중이면 시작 버튼 숨김
+                binding.startOverlay.visibility = if (searchState == SearchState.SEARCHING || searchState == SearchState.LOCKED) View.GONE else View.VISIBLE
                 binding.voiceFlowButtons.visibility = View.GONE
             }
             else -> {
