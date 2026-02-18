@@ -298,6 +298,12 @@ class HomeFragment : Fragment() {
     override fun onPause() {
         super.onPause()
         resetGlobalState()
+        // 화면 꺼짐(일시정지) 시 즉시 리소스 해제 — 카메라·TTS·STT 중단 (배터리·정책 대응)
+        cancelSearchTimeout()
+        stopPositionAnnounce()
+        try { stopCamera() } catch (_: Exception) {}
+        sttManager?.stopListening()
+        ttsManager?.stop()
     }
 
     override fun onStop() {
