@@ -28,7 +28,8 @@ private const val TRANSLATION_WEIGHT = 0.4f
 private const val OUT_OF_BOUNDS_MARGIN = 150f
 /** 연속 N프레임 화면 밖이어야 고정 해제 (노이즈로 인한 급격한 해제 방지) */
 private const val OUT_OF_BOUNDS_FRAMES_TO_LOSE = 15
-/** 자이로 워밍업: 이 시간(ms) 동안은 센서 보정 없이 고정 위치 유지 */
+private const val TAG_GYRO = "GyroTrack"
+/** 자이로 워밍업: 이 시간(ms) 동안은 센서 보정 없이 고정 위치 유지. 찾은 직후 박스가 날아가는 것 방지 */
 private const val GYRO_WARMUP_MS = 500L
 
 /** 회전 적용한 박스 업데이트: rect + 화면 롤(옆으로 눕힌 각도, 도) */
@@ -56,6 +57,8 @@ class GyroTrackingManager(
     private var startTrackingWallTimeMs: Long = 0
     private var outOfBoundsCount = 0
     private var smoothedRollDegrees = 0f
+    /** 워밍업 종료 시 기준 회전을 현재 값으로 리셋했는지 (한 번에 1.2초치 회전이 적용되는 것 방지) */
+    private var warmupReferenceReset = false
 
     // 화면 크기 및 FOV
     private var screenWidth = 1080f
@@ -75,6 +78,7 @@ class GyroTrackingManager(
     fun startTracking(rect: RectF, width: Int, height: Int) {
         initialRect.set(rect)
         currentSmoothedRect.set(rect)
+        Log.d(TAG_GYRO, "startTracking rect=[${rect.left},${rect.top},${rect.right},${rect.bottom}] size=${rect.width()}x${rect.height()} imageSize=${width}x${height}")
 
         screenWidth = width.toFloat()
         screenHeight = height.toFloat()
@@ -92,6 +96,7 @@ class GyroTrackingManager(
         startTrackingWallTimeMs = System.currentTimeMillis()
         outOfBoundsCount = 0
         smoothedRollDegrees = 0f
+        warmupReferenceReset = false
 
         rotationVectorSensor?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
@@ -108,6 +113,7 @@ class GyroTrackingManager(
 
     /** YOLOX 검증 시 시각적 위치로 보정 (드리프트 제거) */
     fun correctPosition(rect: RectF) {
+        Log.d(TAG_GYRO, "correctPosition rect=[${rect.left},${rect.top},${rect.right},${rect.bottom}]")
         initialRect.set(rect)
         currentSmoothedRect.set(rect)
         velocityX = 0f
@@ -195,6 +201,7 @@ class GyroTrackingManager(
         if (timestamp == 0L) {
             initialRotationMatrix = adjustedRotationMatrix.clone()
             timestamp = event.timestamp
+            Log.d(TAG_GYRO, "processRotationVector first event, set initialRotationMatrix only")
             return
         }
 
@@ -224,6 +231,20 @@ class GyroTrackingManager(
         if (elapsedMs < GYRO_WARMUP_MS) {
             val update = BoxUpdate(currentSmoothedRect, -smoothedRollDegrees)
             if (!suspendUpdates) onBoxUpdate(update)
+            if (elapsedMs % 300 < 50) Log.d(TAG_GYRO, "warmup elapsed=${elapsedMs}ms rect=[${currentSmoothedRect.left},${currentSmoothedRect.top}] (no shift)")
+            return
+        }
+
+        // 워밍업 직후 첫 프레임: 기준 회전을 "지금"으로 리셋. 그렇지 않으면 1.2초치 누적 회전이 한 번에 적용되어 박스가 왼쪽으로 튐
+        if (!warmupReferenceReset) {
+            warmupReferenceReset = true
+            initialRotationMatrix = adjustedRotationMatrix.clone()
+            velocityX = 0f
+            velocityY = 0f
+            distanceX = 0f
+            distanceY = 0f
+            lastTimestampAccel = 0L
+            Log.d(TAG_GYRO, "warmup ended: reset rotation reference and translation state")
             return
         }
 
@@ -238,8 +259,11 @@ class GyroTrackingManager(
         val targetX = initialRect.left + rotationShiftX - translationShiftX
         val targetY = initialRect.top + rotationShiftY - translationShiftY
 
-        val newLeft = currentSmoothedRect.left + (targetX - currentSmoothedRect.left) * SMOOTHING_ALPHA
-        val newTop = currentSmoothedRect.top + (targetY - currentSmoothedRect.top) * SMOOTHING_ALPHA
+        val dx = (targetX - currentSmoothedRect.left) * SMOOTHING_ALPHA
+        val dy = (targetY - currentSmoothedRect.top) * SMOOTHING_ALPHA
+
+        val newLeft = currentSmoothedRect.left + dx
+        val newTop = currentSmoothedRect.top + dy
 
         currentSmoothedRect.set(newLeft, newTop, newLeft + initialRect.width(), newTop + initialRect.height())
 
@@ -252,6 +276,7 @@ class GyroTrackingManager(
         if (suspendUpdates) return  // occlusion: optical flow가 박스 위치 담당
         if (isOutOfBounds) {
             outOfBoundsCount++
+            Log.w(TAG_GYRO, "outOfBounds count=$outOfBoundsCount rect=[${currentSmoothedRect.left},${currentSmoothedRect.top},${currentSmoothedRect.right},${currentSmoothedRect.bottom}] screen=${screenWidth}x${screenHeight}")
             if (outOfBoundsCount >= OUT_OF_BOUNDS_FRAMES_TO_LOSE) {
                 stopTracking()
                 onTrackingLost()
