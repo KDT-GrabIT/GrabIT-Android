@@ -10,7 +10,10 @@ import android.view.View
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.ViewModelProvider
+import com.example.grabit_test.data.product.ProductDimensionRepository
+import kotlinx.coroutines.launch
 import androidx.navigation.fragment.NavHostFragment
 import androidx.navigation.ui.setupWithNavController
 import com.example.grabitTest.databinding.ActivityMainBinding
@@ -62,6 +65,11 @@ class MainActivity : AppCompatActivity() {
             val insets = windowInsets.getInsets(WindowInsetsCompat.Type.statusBars())
             view.setPadding(insets.left, insets.top, insets.right, 0)
             windowInsets
+        }
+
+        // 상품 치수(meta.xml 상단 width/length/height) DB 시드: assets/product_dimensions.json → Room
+        lifecycleScope.launch {
+            ProductDimensionRepository.seedFromAssetsIfNeeded(this@MainActivity)
         }
     }
 
