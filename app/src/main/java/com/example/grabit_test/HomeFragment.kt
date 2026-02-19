@@ -123,30 +123,28 @@ class HomeFragment : Fragment() {
     private val currentTargetLabel = AtomicReference<String>("")
 
     private var lastDirectionGuidanceTime = 0L
-    private var lastPreciseDirectionTime = 0L
     private var lastDistanceGuidanceTime = 0L
     private var lastActionGuidanceTime = 0L
     private val DIRECTION_GUIDANCE_COOLDOWN_MS = 4000L   // 왼쪽/오른쪽 (4초)
     private val DISTANCE_GUIDANCE_COOLDOWN_MS = 7000L    // "앞으로 오세요" (7초)
     private val ACTION_GUIDANCE_COOLDOWN_MS = 10000L    // "손을 뻗어 확인해보세요" (10초)
-    private val PROXIMITY_MODE_MM = 700f                // 이 거리 이하 → 근거리 모드(비프 + N시 방향 손 뻗기)
-    private val PRECISE_DIRECTION_COOLDOWN_MS = 5000L   // "N시 방향, 우측 n도" 안내 쿨다운
+    private val PROXIMITY_MODE_MM = 700f                // 이 거리 이하 → 근거리 모드(비프 + 9구역 손 뻗기)
     private val SAFE_ZONE_LEFT = 0.42f   // centerXNorm < 0.42 → Left Zone
     private val SAFE_ZONE_RIGHT = 0.58f  // centerXNorm > 0.58 → Right Zone (Safe: 0.42..0.58)
     private val REACH_ZONE_TOP = 0.35f   // centerYNorm < 0.35 → 위쪽 손 뻗기
     private val REACH_ZONE_BOTTOM = 0.65f // centerYNorm > 0.65 → 아래쪽 손 뻗기
     private val SEARCH_PING_INTERVAL_MS = 12000L  // 탐색 침묵 12초 시 핑 안내
     private var lastSearchPingTime = 0L
+    /** SEARCHING에서 5초 이상 미탐지 시 "상품이 보이지 않습니다" 안내 */
+    private val SEARCH_OBJECT_NOT_FOUND_ANNOUNCE_MS = 5000L
+    private var lastSearchNoDetectionStartMs = 0L
+    private var searchObjectNotFoundAnnounced = false
     private val TARGET_BOX_RATIO = 0.12f  // 폴백: 거리 계산 실패 시 사용
     private val CLOSE_DISTANCE_STABILITY_FRAMES = 18   // 연속 N프레임 시 "손을 뻗어" 허용 (기존 30 → 완화)
     private var closeDistanceFrameCount = 0
     private val FOCAL_LENGTH_FACTOR = 1.1f   // pinhole: FocalLength = imageHeight * this
     private val DISTANCE_CALIBRATION_FACTOR = 1.5f  // 거리 과소측정 보정 (기기별 FOV/렌즈 튜닝용, 1.3 = 30% 멀게)
-    private val DISTANCE_NEAR_MM = 620f       // 이 거리 이하 → "손을 뻗어 확인해보세요" (기존 450 → 완화, 접촉 판정 거리)
-    private val DISTANCE_LONG_RANGE_MM = 1500f // 1.5m 이상 → 걸음수 안내(원거리)
-    private val STEP_STRIDE_MM = 650f          // 성인 평균 보폭 65cm
-    private val STEP_GUIDANCE_PAUSE_MS = 5000L // 걸음 안내 후 5초간 추가 안내 휴식
-    private var lastStepGuidanceTime = 0L
+    private val DISTANCE_NEAR_MM = 620f       // 이 거리 이하 → "손을 뻗어 확인해보세요" (접촉 판정 거리). 모든 객체 1.5m 이내 가정, 화면 구역 안내 중심
 
     /** YOLOX 타일링: 먼/작은 물체용. 1x1 → 2x2 → 3x3 단계적 사용, 상호 배제 */
     private val ENABLE_YOLOX_TILING = true
@@ -178,7 +176,21 @@ class HomeFragment : Fragment() {
     @Volatile private var searchTimeoutAborted = false
     private val SEARCH_TIMEOUT_MS = 30_000L
     private val POSITION_ANNOUNCE_INTERVAL_MS = 5000L
+    /** 같은 상품 위치 안내 중복 방지: 이 간격 미만이면 안내 생략(재인식 시 말 끊김/반복 방지) */
+    private val POSITION_ANNOUNCE_MIN_GAP_MS = 4500L
+    /** 위치 안내 시작: 사용자가 1초간 큰 움직임 없을 때부터 안내 시작 */
+    private val POSITION_ANNOUNCE_STABILITY_MS = 1000L
+    private val POSITION_ANNOUNCE_STABILITY_CHECK_MS = 500L
+    /** 박스 중심이 이 비율(화면 대비) 이상 움직이면 '큰 움직임'으로 간주 */
+    private val POSITION_ANNOUNCE_MOVEMENT_THRESHOLD_NORM = 0.03f
+    /** 구역이 바뀌었을 때 최소 간격(이 간격 지나면 변경된 안내 가능) */
+    private val POSITION_ANNOUNCE_ZONE_CHANGE_MIN_GAP_MS = 2000L
     private var positionAnnounceRunnable: Runnable? = null
+    private var lastPositionAnnounceEnqueueTimeMs = 0L
+    private var positionAnnounceStabilitySatisfied = false
+    private var lastPositionStabilityRefRect: RectF? = null
+    private var lastLargeMovementTime = 0L
+    private var lastAnnouncedZone: String? = null
     private var voiceSearchTargetLabel: String? = null
     /** 마이페이지/관리자에서 상품 선택 후 홈 진입 시, TTS 준비되면 재생·탐지 (TTS 비동기 초기화 대응) */
     private var pendingSearchTarget: String? = null
@@ -495,10 +507,8 @@ class HomeFragment : Fragment() {
         validationFailCount = 0
         closeDistanceFrameCount = 0
         lastDirectionGuidanceTime = 0L
-        lastPreciseDirectionTime = 0L
         lastDistanceGuidanceTime = 0L
         lastActionGuidanceTime = 0L
-        lastStepGuidanceTime = 0L
         lastSearchPingTime = 0L
         lastTargetBox = null
         missedFramesCount = 0
@@ -952,6 +962,11 @@ class HomeFragment : Fragment() {
 
     private fun startPositionAnnounce() {
         stopPositionAnnounce()
+        lastPositionAnnounceEnqueueTimeMs = 0L
+        positionAnnounceStabilitySatisfied = false
+        lastPositionStabilityRefRect = null
+        lastLargeMovementTime = 0L
+        lastAnnouncedZone = null
         positionAnnounceRunnable = object : Runnable {
             override fun run() {
                 if (waitingForTouchConfirm) {
@@ -967,13 +982,54 @@ class HomeFragment : Fragment() {
                     searchTimeoutHandler.postDelayed(this, POSITION_ANNOUNCE_INTERVAL_MS)
                     return
                 }
+                val now = System.currentTimeMillis()
+                val rect = box.rect
+
+                // 1초간 큰 움직임 없을 때까지는 안내 대기
+                if (!positionAnnounceStabilitySatisfied) {
+                    val ref = lastPositionStabilityRefRect
+                    if (ref == null) {
+                        lastPositionStabilityRefRect = RectF(rect)
+                        lastLargeMovementTime = now
+                        searchTimeoutHandler.postDelayed(this, POSITION_ANNOUNCE_STABILITY_CHECK_MS)
+                        return
+                    }
+                    val dx = (rect.centerX() - ref.centerX()) / w.coerceAtLeast(1)
+                    val dy = (rect.centerY() - ref.centerY()) / h.coerceAtLeast(1)
+                    val moveNorm = kotlin.math.sqrt(dx * dx + dy * dy)
+                    if (moveNorm >= POSITION_ANNOUNCE_MOVEMENT_THRESHOLD_NORM) {
+                        lastLargeMovementTime = now
+                        lastPositionStabilityRefRect = RectF(rect)
+                        searchTimeoutHandler.postDelayed(this, POSITION_ANNOUNCE_STABILITY_CHECK_MS)
+                        return
+                    }
+                    if (now - lastLargeMovementTime < POSITION_ANNOUNCE_STABILITY_MS) {
+                        searchTimeoutHandler.postDelayed(this, POSITION_ANNOUNCE_STABILITY_CHECK_MS)
+                        return
+                    }
+                    positionAnnounceStabilitySatisfied = true
+                }
+
+                // 구역 변경 시 더 짧은 간격으로도 변경된 안내 허용
+                val currentZone = voiceFlowController?.getZoneName(rect, w, h)
+                val allowByGap = (now - lastPositionAnnounceEnqueueTimeMs >= POSITION_ANNOUNCE_MIN_GAP_MS)
+                val allowByZoneChange = (currentZone != null && currentZone != lastAnnouncedZone &&
+                    (now - lastPositionAnnounceEnqueueTimeMs >= POSITION_ANNOUNCE_ZONE_CHANGE_MIN_GAP_MS))
+                if (!allowByGap && !allowByZoneChange) {
+                    searchTimeoutHandler.postDelayed(this, POSITION_ANNOUNCE_INTERVAL_MS)
+                    return
+                }
+
                 val displayName = if (ProductDictionary.isLoaded())
                     ProductDictionary.getDisplayNameKo(lockedTargetLabel) else lockedTargetLabel
-                voiceFlowController?.announcePosition(displayName, box.rect, w, h)
+                val message = voiceFlowController?.getPositionAnnounceMessage(displayName, box.rect, w, h, distMm) ?: return
+                speak(message, urgent = false)
+                lastPositionAnnounceEnqueueTimeMs = now
+                lastAnnouncedZone = currentZone
                 searchTimeoutHandler.postDelayed(this, POSITION_ANNOUNCE_INTERVAL_MS)
             }
         }
-        searchTimeoutHandler.postDelayed(positionAnnounceRunnable!!, POSITION_ANNOUNCE_INTERVAL_MS)
+        searchTimeoutHandler.postDelayed(positionAnnounceRunnable!!, POSITION_ANNOUNCE_STABILITY_CHECK_MS)
     }
 
     private fun stopPositionAnnounce() {
@@ -1079,7 +1135,6 @@ class HomeFragment : Fragment() {
         val centerXNorm = boxCenterX / imageWidth
         val centerYNorm = (box.rect.top + box.rect.bottom) / 2f / imageHeight.coerceAtLeast(1)
         val now = System.currentTimeMillis()
-        val preciseDir = PreciseDirection.getPreciseDirection(centerXNorm, centerYNorm)
         requireActivity().runOnUiThread {
             val boxWidthPx = box.rect.width()
             val zoomRatio = currentZoomRatio
@@ -1103,7 +1158,6 @@ class HomeFragment : Fragment() {
             if (distMm <= 400f) {
                 val inEdgeGuard = centerXNorm < 0.05f || centerXNorm > 0.95f || centerYNorm < 0.05f || centerYNorm > 0.95f
                 if (!inEdgeGuard) {
-                    if (now - lastStepGuidanceTime < STEP_GUIDANCE_PAUSE_MS) return@runOnUiThread
                     when {
                         distMm <= DISTANCE_NEAR_MM -> {
                             if (missedFramesCount > 0) {
@@ -1114,15 +1168,8 @@ class HomeFragment : Fragment() {
                                     now - lastActionGuidanceTime >= ACTION_GUIDANCE_COOLDOWN_MS) {
                                     lastActionGuidanceTime = now
                                     closeDistanceFrameCount = 0
-                                    val reachMsg = if (distMm <= PROXIMITY_MODE_MM) {
-                                        PreciseDirection.formatProximityReach(preciseDir.clockHour)
-                                    } else {
-                                        when {
-                                            centerYNorm < REACH_ZONE_TOP -> "위쪽으로 손을 뻗어 확인해보세요."
-                                            centerYNorm > REACH_ZONE_BOTTOM -> "아래쪽으로 손을 뻗어 확인해보세요."
-                                            else -> "정면으로 손을 뻗어 확인해보세요."
-                                        }
-                                    }
+                                    val reachMsg = voiceFlowController?.getProximityReachMessage(box.rect, imageWidth, imageHeight)
+                                        ?: "상품이 가까이 있습니다. 손을 뻗어 확인해보세요."
                                     speak(reachMsg, false)
                                 }
                             }
@@ -1135,20 +1182,14 @@ class HomeFragment : Fragment() {
 
             val leftBound = if (distMm <= 500f) 0.15f else SAFE_ZONE_LEFT
             val rightBound = if (distMm <= 500f) 0.85f else SAFE_ZONE_RIGHT
-            val offset = centerXNorm - 0.5f
 
             when {
                 centerXNorm < leftBound -> {
                     closeDistanceFrameCount = 0
                     if (now - lastDirectionGuidanceTime >= DIRECTION_GUIDANCE_COOLDOWN_MS) {
                         lastDirectionGuidanceTime = now
-                        val msg = if (offset < -0.25f) "왼방향으로 많이 회전하세요." else "왼방향으로 살짝 회전하세요."
-                        speak(msg, false)
-                    }
-                    if (now - lastPreciseDirectionTime >= PRECISE_DIRECTION_COOLDOWN_MS) {
-                        lastPreciseDirectionTime = now
-                        val preciseMsg = PreciseDirection.formatImmediateGuidance(preciseDir.clockHour, preciseDir.horizontalDeg, preciseDir.verticalDeg)
-                        speak(preciseMsg, false)
+                        val msg = voiceFlowController?.getPositionAnnounceMessage(box.label, box.rect, imageWidth, imageHeight, distMm)
+                        if (msg != null) speak(msg, false)
                     }
                     return@runOnUiThread
                 }
@@ -1156,29 +1197,14 @@ class HomeFragment : Fragment() {
                     closeDistanceFrameCount = 0
                     if (now - lastDirectionGuidanceTime >= DIRECTION_GUIDANCE_COOLDOWN_MS) {
                         lastDirectionGuidanceTime = now
-                        val msg = if (offset > 0.25f) "오른방향으로 많이 회전하세요." else "오른방향으로 살짝 회전하세요."
-                        speak(msg, false)
-                    }
-                    if (now - lastPreciseDirectionTime >= PRECISE_DIRECTION_COOLDOWN_MS) {
-                        lastPreciseDirectionTime = now
-                        val preciseMsg = PreciseDirection.formatImmediateGuidance(preciseDir.clockHour, preciseDir.horizontalDeg, preciseDir.verticalDeg)
-                        speak(preciseMsg, false)
+                        val msg = voiceFlowController?.getPositionAnnounceMessage(box.label, box.rect, imageWidth, imageHeight, distMm)
+                        if (msg != null) speak(msg, false)
                     }
                     return@runOnUiThread
                 }
                 else -> {
-                    if (now - lastStepGuidanceTime < STEP_GUIDANCE_PAUSE_MS) return@runOnUiThread
                     val distanceMm = distMm
-                    val boxRatio = (box.rect.width() * box.rect.height()) / totalArea
                     when {
-                        distanceMm >= DISTANCE_LONG_RANGE_MM && distanceMm.isFinite() && distanceMm <= 50000f -> {
-                            if (now - lastStepGuidanceTime >= STEP_GUIDANCE_PAUSE_MS) {
-                                lastStepGuidanceTime = now
-                                val distanceM = (distanceMm / 1000f).toInt().coerceIn(1, 50)
-                                val steps = (distanceMm / STEP_STRIDE_MM).toInt().coerceAtLeast(1)
-                                speak("주변 장애물에 주의하며, 약 ${steps}걸음 앞으로 걸어가세요.", false)
-                            }
-                        }
                         distanceMm <= DISTANCE_NEAR_MM -> {
                             if (missedFramesCount > 0) {
                                 closeDistanceFrameCount = 0
@@ -1188,27 +1214,13 @@ class HomeFragment : Fragment() {
                                     now - lastActionGuidanceTime >= ACTION_GUIDANCE_COOLDOWN_MS) {
                                     lastActionGuidanceTime = now
                                     closeDistanceFrameCount = 0
-                                    val reachMsg = if (distMm <= PROXIMITY_MODE_MM) {
-                                        PreciseDirection.formatProximityReach(preciseDir.clockHour)
-                                    } else {
-                                        when {
-                                            centerYNorm < REACH_ZONE_TOP -> "위쪽으로 손을 뻗어 확인해보세요."
-                                            centerYNorm > REACH_ZONE_BOTTOM -> "아래쪽으로 손을 뻗어 확인해보세요."
-                                            else -> "정면으로 손을 뻗어 확인해보세요."
-                                        }
-                                    }
+                                    val reachMsg = voiceFlowController?.getProximityReachMessage(box.rect, imageWidth, imageHeight)
+                                        ?: "상품이 가까이 있습니다. 손을 뻗어 확인해보세요."
                                     speak(reachMsg, false)
                                 }
                             }
                         }
-                        else -> {
-                            closeDistanceFrameCount = 0
-                            if (now - lastDistanceGuidanceTime >= DISTANCE_GUIDANCE_COOLDOWN_MS &&
-                                boxRatio < TARGET_BOX_RATIO) {
-                                lastDistanceGuidanceTime = now
-                                speak("조금 더 앞으로 오세요", false)
-                            }
-                        }
+                        else -> { /* 1.5m 이내 가정, 화면 구역 안내는 주기 announce에서 처리 */ }
                     }
                 }
             }
@@ -1330,11 +1342,10 @@ class HomeFragment : Fragment() {
                 lastFoundAnnounceTimeMs = nowMs
                 lastFoundAnnounceLabel = actualLabel
                 vibrateFeedback()
-                val displayName = if (ProductDictionary.isLoaded()) ProductDictionary.getDisplayNameKo(actualLabel) else actualLabel
                 val message = if (fromTiling && tilingGridUsed == 3) {
-                    "${displayName}를 찾았습니다. 아직 멀리 있어요. 위치 안내에 맞춰 조금 더 가까이 가보세요."
+                    "상품을 찾았습니다. 아직 멀리 있어요. 위치 안내에 맞춰 조금 더 가까이 가보세요."
                 } else {
-                    "${displayName}를 ${percent}% 확률로 찾았습니다. 손을 뻗어 잡아주세요."
+                    "상품을 ${percent}% 확률로 찾았습니다. 손을 뻗어 잡아주세요."
                 }
                 speak(message)
             }
@@ -1358,6 +1369,8 @@ class HomeFragment : Fragment() {
             lastTier1NoMatchTimeMs = 0L
             lastTier2NoMatchTimeMs = 0L
             searchFrameCountInTier3 = 0
+            lastSearchNoDetectionStartMs = 0L
+            searchObjectNotFoundAnnounced = false
             if (isNewSearchSession) {
                 hasAnnouncedDetectedThisSearchSession = false
                 lastFoundAnnounceLabel = null
@@ -1384,7 +1397,6 @@ class HomeFragment : Fragment() {
             lastDirectionGuidanceTime = 0L
             lastDistanceGuidanceTime = 0L
             lastActionGuidanceTime = 0L
-            lastStepGuidanceTime = 0L
             closeDistanceFrameCount = 0
             lastTargetBox = null
             missedFramesCount = 0
@@ -1517,7 +1529,7 @@ class HomeFragment : Fragment() {
         val resolutionSelector = ResolutionSelector.Builder()
             .setResolutionStrategy(
                 ResolutionStrategy(
-                    Size(1280, 720),
+                    Size(1440, 1080),
                     ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
                 )
             )
@@ -2035,6 +2047,9 @@ class HomeFragment : Fragment() {
             if (!firstResolutionLogged) {
                 firstResolutionLogged = true
                 Log.d(TAG, "Camera resolution (ImageAnalysis): ${w}x${h}, rotation=$rotationDegrees")
+                requireActivity().runOnUiThread {
+                    _binding?.cameraResolutionText?.text = "${w} × ${h}"
+                }
             }
             var inferMs = System.currentTimeMillis() - startTime
 
@@ -2113,6 +2128,8 @@ class HomeFragment : Fragment() {
                         val combined = whenResult.second
                         processAutoZoom(combined, w, h)
                         if (matchRes != null) {
+                            lastSearchNoDetectionStartMs = 0L
+                            searchObjectNotFoundAnnounced = false
                             val (matched, actualPrimaryLabel) = matchRes
                             pendingLockMissCount = 0
                             if (matched.confidence >= TARGET_CONFIDENCE_THRESHOLD) {
@@ -2150,6 +2167,13 @@ class HomeFragment : Fragment() {
                                 pendingLockMissCount = 0
                             }
                             val nowPing = System.currentTimeMillis()
+                            if (lastSearchNoDetectionStartMs == 0L) lastSearchNoDetectionStartMs = nowPing
+                            if (!searchObjectNotFoundAnnounced && (nowPing - lastSearchNoDetectionStartMs >= SEARCH_OBJECT_NOT_FOUND_ANNOUNCE_MS)) {
+                                searchObjectNotFoundAnnounced = true
+                                requireActivity().runOnUiThread {
+                                    speak("상품이 보이지 않습니다. 주변을 확인하기 위해 핸드폰을 옆으로 천천히 움직여보세요.", false)
+                                }
+                            }
                             if (nowPing - lastSearchPingTime >= SEARCH_PING_INTERVAL_MS) {
                                 requireActivity().runOnUiThread {
                                     lastSearchPingTime = System.currentTimeMillis()

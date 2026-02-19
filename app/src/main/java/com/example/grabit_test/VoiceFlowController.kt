@@ -31,16 +31,17 @@ class VoiceFlowController(
             "내 정보의 자주 찾는 상품, 최근 찾은 상품에서 항목을 누르면 해당 상품 찾기가 바로 시작됩니다.\n\n" +
             "도움말이라고 말하시면 이 사용방법을 다시 들으실 수 있습니다."
 
+        /** 확인 단계: 사용자가 무엇을 찾는지 알 수 있도록 상품명 유지 */
         fun msgConfirmProduct(productName: String) =
             "찾으시는 상품이 ${productName} 맞습니까? 맞으면 '예'라고 말해주세요."
 
-        fun msgSearching(productName: String) = "${productName}을 찾고 있습니다. 잠시만 기다려주세요."
+        fun msgSearching(productName: String) = "상품을 찾고 있습니다. 잠시만 기다려주세요."
 
         const val MSG_CAMERA_ON = "카메라가 켜졌습니다."
 
         fun msgSearchResult(productName: String, confidencePercent: Int? = null) =
-            if (confidencePercent != null) "${productName}를 ${confidencePercent}% 확률로 찾았습니다."
-            else "${productName}를 찾았습니다."
+            if (confidencePercent != null) "상품을 ${confidencePercent}% 확률로 찾았습니다."
+            else "상품을 찾았습니다."
 
         const val MSG_SEARCH_FAILED =
             "상품을 찾지 못했습니다. 다시 찾으시겠습니까?"
@@ -239,24 +240,110 @@ class VoiceFlowController(
         }
     }
 
-    /** 위치 안내를 주기적으로 반복할 때 호출 (상품명 + 방향/거리) */
-    fun announcePosition(displayName: String, boxRect: RectF, imageWidth: Int, imageHeight: Int) {
-        val guidance = buildPositionGuidance(boxRect, imageWidth, imageHeight)
-        speak("$displayName. $guidance")
+    /** 위치 안내를 주기적으로 반복할 때 호출 (화면 9구역 기반 + 핸드폰 조작 유도). */
+    fun announcePosition(displayName: String, boxRect: RectF, imageWidth: Int, imageHeight: Int, distMm: Float) {
+        speak(getPositionAnnounceMessage(displayName, boxRect, imageWidth, imageHeight, distMm))
+    }
+
+    /** 주기 위치 안내 문장만 생성: "상품이 [구역]에 있습니다. 핸드폰을 [방향]으로 움직여주세요" (화면 9구역). */
+    fun getPositionAnnounceMessage(displayName: String, boxRect: RectF, imageWidth: Int, imageHeight: Int, distMm: Float): String {
+        return buildPositionGuidance(boxRect, imageWidth, imageHeight)
+    }
+
+    /** 현재 박스가 속한 9구역 이름만 반환 (구역 변경 감지용). */
+    fun getZoneName(boxRect: RectF, imageWidth: Int, imageHeight: Int): String {
+        if (imageWidth <= 0 || imageHeight <= 0) return "화면 안"
+        val centerXNorm = (boxRect.left + boxRect.right) / 2f / imageWidth
+        val centerYNorm = (boxRect.top + boxRect.bottom) / 2f / imageHeight
+        val zoneCol = when {
+            centerXNorm < 1f / 3f -> 0
+            centerXNorm < 2f / 3f -> 1
+            else -> 2
+        }
+        val zoneRow = when {
+            centerYNorm < 1f / 3f -> 0
+            centerYNorm < 2f / 3f -> 1
+            else -> 2
+        }
+        return when (zoneRow to zoneCol) {
+            0 to 0 -> "좌측 상단"
+            0 to 1 -> "중앙 상단"
+            0 to 2 -> "우측 상단"
+            1 to 0 -> "좌측"
+            1 to 1 -> "정면"
+            1 to 2 -> "우측"
+            2 to 0 -> "좌측 하단"
+            2 to 1 -> "중앙 하단"
+            2 to 2 -> "우측 하단"
+            else -> "화면 안"
+        }
     }
 
     /**
-     * 사용자 기준 방향만 짧게 안내 (5초마다 재생)
+     * 화면을 9구역(좌상단·중앙상단·우상단 / 좌측·정면·우측 / 좌하단·중앙하단·우하단)으로 나누어
+     * "상품이 [구역]에 있습니다. 핸드폰을 [방향]으로 움직여주세요" 형식으로 반환.
      */
     private fun buildPositionGuidance(box: RectF, w: Int, h: Int): String {
-        val centerX = (box.left + box.right) / 2f / w
-        return when {
-            centerX < 0.3f -> "왼쪽."
-            centerX < 0.45f -> "조금 왼쪽."
-            centerX < 0.55f -> "정면."
-            centerX < 0.7f -> "조금 오른쪽."
-            else -> "오른쪽."
+        if (w <= 0 || h <= 0) return "상품이 화면 안에 있습니다. 핸드폰을 천천히 움직여보세요."
+        val centerXNorm = (box.left + box.right) / 2f / w
+        val centerYNorm = (box.top + box.bottom) / 2f / h
+        val zoneCol = when {
+            centerXNorm < 1f / 3f -> 0
+            centerXNorm < 2f / 3f -> 1
+            else -> 2
         }
+        val zoneRow = when {
+            centerYNorm < 1f / 3f -> 0
+            centerYNorm < 2f / 3f -> 1
+            else -> 2
+        }
+        val (zoneName, actionDir) = when (zoneRow to zoneCol) {
+            0 to 0 -> "좌측 상단" to "왼쪽 위로 조금"
+            0 to 1 -> "중앙 상단" to "위로 조금"
+            0 to 2 -> "우측 상단" to "오른쪽 위로 조금"
+            1 to 0 -> "좌측" to "왼쪽으로 조금"
+            1 to 1 -> "정면" to "그대로 두고 손을 뻗어 확인해보세요"
+            1 to 2 -> "우측" to "오른쪽으로 조금"
+            2 to 0 -> "좌측 하단" to "왼쪽 아래로 조금"
+            2 to 1 -> "중앙 하단" to "아래로 조금"
+            2 to 2 -> "우측 하단" to "오른쪽 아래로 조금"
+            else -> "화면 안" to "천천히 움직여보세요"
+        }
+        return if (zoneName == "정면") {
+            "상품이 정면에 있습니다. $actionDir."
+        } else {
+            "상품이 ${zoneName}에 있습니다. 핸드폰을 $actionDir 움직여주세요."
+        }
+    }
+
+    /** 근거리(손 뻗기) 안내: 9구역 기준 "상품이 [구역]에 있습니다. 손을 뻗어 확인해보세요." */
+    fun getProximityReachMessage(boxRect: RectF, imageWidth: Int, imageHeight: Int): String {
+        if (imageWidth <= 0 || imageHeight <= 0) return "상품이 가까이 있습니다. 손을 뻗어 확인해보세요."
+        val centerXNorm = (boxRect.left + boxRect.right) / 2f / imageWidth
+        val centerYNorm = (boxRect.top + boxRect.bottom) / 2f / imageHeight
+        val zoneCol = when {
+            centerXNorm < 1f / 3f -> 0
+            centerXNorm < 2f / 3f -> 1
+            else -> 2
+        }
+        val zoneRow = when {
+            centerYNorm < 1f / 3f -> 0
+            centerYNorm < 2f / 3f -> 1
+            else -> 2
+        }
+        val zoneName = when (zoneRow to zoneCol) {
+            0 to 0 -> "좌측 상단"
+            0 to 1 -> "중앙 상단"
+            0 to 2 -> "우측 상단"
+            1 to 0 -> "좌측"
+            1 to 1 -> "정면"
+            1 to 2 -> "우측"
+            2 to 0 -> "좌측 하단"
+            2 to 1 -> "중앙 하단"
+            2 to 2 -> "우측 하단"
+            else -> "화면 안"
+        }
+        return "상품이 ${zoneName}에 있습니다. 손을 뻗어 확인해보세요."
     }
 
     /** 다시 찾기 */

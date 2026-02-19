@@ -38,7 +38,7 @@ class TTSManager(
                 if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
                     Log.w(TAG, "한국어 TTS 미지원, 기본 언어 사용")
                 }
-                textToSpeech?.setSpeechRate(0.82f)
+                textToSpeech?.setSpeechRate(1.2f)  // 1.0=보통, 1.2=약 1.2배속
                 textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {}
                     override fun onDone(utteranceId: String?) {
