@@ -12,7 +12,9 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.ViewModelProvider
+import com.example.grabitTest.data.synonym.SynonymRepository
 import com.example.grabit_test.data.product.ProductDimensionRepository
+import com.example.grabit_test.data.sync.DataSyncManager
 import kotlinx.coroutines.launch
 import androidx.navigation.fragment.NavHostFragment
 import androidx.navigation.ui.setupWithNavController
@@ -67,9 +69,11 @@ class MainActivity : AppCompatActivity() {
             windowInsets
         }
 
-        // 상품 치수(meta.xml 상단 width/length/height) DB 시드: assets/product_dimensions.json → Room
+        // Sync remote data once, then load local caches for runtime use.
         lifecycleScope.launch {
-            ProductDimensionRepository.seedFromAssetsIfNeeded(this@MainActivity)
+            DataSyncManager.syncAll(this@MainActivity)
+            SynonymRepository.loadFromLocal(this@MainActivity)
+            ProductDimensionRepository.loadFromLocal(this@MainActivity)
         }
     }
 
