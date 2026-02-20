@@ -28,8 +28,12 @@ private const val TRANSLATION_WEIGHT = 0.4f
 private const val OUT_OF_BOUNDS_MARGIN = 150f
 /** 연속 N프레임 화면 밖이어야 고정 해제 (노이즈로 인한 급격한 해제 방지) */
 private const val OUT_OF_BOUNDS_FRAMES_TO_LOSE = 15
-/** 자이로 워밍업: 이 시간(ms) 동안은 센서 보정 없이 고정 위치 유지 */
+private const val TAG_GYRO = "GyroTrack"
+/** 자이로 워밍업: 이 시간(ms) 동안은 센서 보정 없이 고정 위치 유지. 찾은 직후 박스가 날아가는 것 방지 */
 private const val GYRO_WARMUP_MS = 500L
+/** 이 yaw 변화량(rad) 이상이면 빠른 회전으로 간주 → onDeltaYawTooHigh 콜백 (TTS "천천히 움직여주세요" 등) */
+private const val DELTA_YAW_FAST_THRESHOLD_RAD = 0.25f
+private const val DELTA_YAW_TOO_HIGH_COOLDOWN_MS = 5000L
 
 /** 회전 적용한 박스 업데이트: rect + 화면 롤(옆으로 눕힌 각도, 도) */
 data class BoxUpdate(val rect: RectF, val rotationDegrees: Float)
@@ -39,6 +43,9 @@ class GyroTrackingManager(
     private val onBoxUpdate: (BoxUpdate) -> Unit,
     private val onTrackingLost: () -> Unit
 ) : SensorEventListener {
+
+    /** 빠른 yaw 회전 시 한 번 호출 (TTS "천천히 움직여주세요" 등). 쿨다운 적용됨 */
+    var onDeltaYawTooHigh: (() -> Unit)? = null
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val rotationVectorSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
@@ -56,6 +63,11 @@ class GyroTrackingManager(
     private var startTrackingWallTimeMs: Long = 0
     private var outOfBoundsCount = 0
     private var smoothedRollDegrees = 0f
+    /** 워밍업 종료 시 기준 회전을 현재 값으로 리셋했는지 (한 번에 1.2초치 회전이 적용되는 것 방지) */
+    private var warmupReferenceReset = false
+    private var lastDeltaYawRad = 0f
+    private var lastDeltaPitchRad = 0f
+    private var lastDeltaYawTooHighInvokedMs = 0L
 
     // 화면 크기 및 FOV
     private var screenWidth = 1080f
@@ -92,6 +104,7 @@ class GyroTrackingManager(
         startTrackingWallTimeMs = System.currentTimeMillis()
         outOfBoundsCount = 0
         smoothedRollDegrees = 0f
+        warmupReferenceReset = false
 
         rotationVectorSensor?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
@@ -127,6 +140,18 @@ class GyroTrackingManager(
 
     /** 자이로 센서로 예측된 현재 박스 위치 (Gyro-Guided Matching용). LOCKED가 아니면 null */
     fun getPredictedRect(): RectF? = if (isLocked) RectF(currentSmoothedRect) else null
+
+    /** 현재 프레임 기준 yaw 변화량(도). 락 시작 시점 대비 */
+    fun getCurrentDeltaYawDegrees(): Float = Math.toDegrees(lastDeltaYawRad.toDouble()).toFloat()
+
+    /** 현재 프레임 기준 pitch 변화량(도). 락 시작 시점 대비 */
+    fun getCurrentDeltaPitchDegrees(): Float = Math.toDegrees(lastDeltaPitchRad.toDouble()).toFloat()
+
+    /** 화면 X 픽셀 오프셋을 수평 각도(도)로 변환 (이미지 너비/FOV 기반) */
+    fun pixelOffsetToDegreesX(deltaPx: Float): Float {
+        if (pixelsPerRadianX <= 0f) return 0f
+        return Math.toDegrees((deltaPx / pixelsPerRadianX).toDouble()).toFloat()
+    }
 
     override fun onSensorChanged(event: SensorEvent?) {
         if (!isLocked || event == null) return
@@ -215,6 +240,16 @@ class GyroTrackingManager(
         if (abs(deltaYaw) < MIN_ROTATION_THRESHOLD) deltaYaw = 0f
         if (abs(deltaPitch) < MIN_ROTATION_THRESHOLD) deltaPitch = 0f
 
+        lastDeltaYawRad = deltaYaw
+        lastDeltaPitchRad = deltaPitch
+        if (kotlin.math.abs(deltaYaw) >= DELTA_YAW_FAST_THRESHOLD_RAD) {
+            val nowMs = System.currentTimeMillis()
+            if (nowMs - lastDeltaYawTooHighInvokedMs >= DELTA_YAW_TOO_HIGH_COOLDOWN_MS) {
+                lastDeltaYawTooHighInvokedMs = nowMs
+                onDeltaYawTooHigh?.invoke()
+            }
+        }
+
         val deltaRollDegrees = Math.toDegrees(deltaRoll.toDouble()).toFloat()
         smoothedRollDegrees += (deltaRollDegrees - smoothedRollDegrees) * SMOOTHING_ALPHA
 
@@ -224,6 +259,18 @@ class GyroTrackingManager(
         if (elapsedMs < GYRO_WARMUP_MS) {
             val update = BoxUpdate(currentSmoothedRect, -smoothedRollDegrees)
             if (!suspendUpdates) onBoxUpdate(update)
+            return
+        }
+
+        // 워밍업 직후 첫 프레임: 기준 회전을 "지금"으로 리셋. 그렇지 않으면 1.2초치 누적 회전이 한 번에 적용되어 박스가 왼쪽으로 튐
+        if (!warmupReferenceReset) {
+            warmupReferenceReset = true
+            initialRotationMatrix = adjustedRotationMatrix.clone()
+            velocityX = 0f
+            velocityY = 0f
+            distanceX = 0f
+            distanceY = 0f
+            lastTimestampAccel = 0L
             return
         }
 
@@ -238,8 +285,11 @@ class GyroTrackingManager(
         val targetX = initialRect.left + rotationShiftX - translationShiftX
         val targetY = initialRect.top + rotationShiftY - translationShiftY
 
-        val newLeft = currentSmoothedRect.left + (targetX - currentSmoothedRect.left) * SMOOTHING_ALPHA
-        val newTop = currentSmoothedRect.top + (targetY - currentSmoothedRect.top) * SMOOTHING_ALPHA
+        val dx = (targetX - currentSmoothedRect.left) * SMOOTHING_ALPHA
+        val dy = (targetY - currentSmoothedRect.top) * SMOOTHING_ALPHA
+
+        val newLeft = currentSmoothedRect.left + dx
+        val newTop = currentSmoothedRect.top + dy
 
         currentSmoothedRect.set(newLeft, newTop, newLeft + initialRect.width(), newTop + initialRect.height())
 
