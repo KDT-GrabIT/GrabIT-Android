@@ -92,7 +92,8 @@ class STTManager(
         )
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+            // true면 오프라인 한국어 팩이 없는 기기에서 ERROR_LANGUAGE_UNAVAILABLE(13)이 자주 난다. 네트워크 인식 허용.
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ko-KR")
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "ko-KR")
             putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, "ko-KR")
@@ -175,6 +176,11 @@ class STTManager(
                 SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "인식기 사용 중"
                 SpeechRecognizer.ERROR_SERVER -> "서버 에러"
                 SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "말 없음 타임아웃"
+                // API 31+ (값 12, 13): 언어 팩/오프라인 인식 관련
+                SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED ->
+                    "이 기기의 음성 인식에서 한국어를 지원하지 않습니다."
+                SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE ->
+                    "한국어 음성 인식 데이터를 쓸 수 없습니다. 인터넷 연결을 확인하거나, 설정에서 ‘Google 음성 입력’ 한국어를 내려받아 주세요."
                 else -> "알 수 없는 에러 (코드: $error)"
             }
             onListeningEndedReason("onError($error)")

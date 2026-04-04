@@ -43,6 +43,8 @@ class VoiceFlowController(
     enum class VoiceFlowState {
         APP_START,
         WAITING_PRODUCT_NAME,
+        /** STT 상품명 → 클래스/표시명 해석 중(비동기). 이 구간에는 확인 멘트를 아직 내지 않음 */
+        RESOLVING_PRODUCT_FOR_CONFIRM,
         CONFIRM_PRODUCT,
         WAITING_CONFIRMATION,
         SEARCHING_PRODUCT,
@@ -87,6 +89,10 @@ class VoiceFlowController(
 
         when (currentState) {
             VoiceFlowState.WAITING_PRODUCT_NAME -> handleProductNameReceived(normalized)
+            VoiceFlowState.RESOLVING_PRODUCT_FOR_CONFIRM -> {
+                if (isRepeatCommand(normalized)) repeatLast()
+                else if (isHelpCommand(normalized)) speakHelp()
+            }
             VoiceFlowState.WAITING_CONFIRMATION -> handleConfirmationReceived(normalized)
             VoiceFlowState.APP_START -> {
                 if (isRepeatCommand(normalized)) repeatLast()
@@ -114,15 +120,31 @@ class VoiceFlowController(
             isRepeatCommand(text) -> repeatLast()
             else -> {
                 currentProductName = text
-                transitionTo(VoiceFlowState.CONFIRM_PRODUCT)
+                transitionTo(VoiceFlowState.RESOLVING_PRODUCT_FOR_CONFIRM)
                 onProductNameEntered(currentProductName)
-                val msg = msgConfirmProduct(currentProductName)
-                speak(msg) {
-                    transitionTo(VoiceFlowState.WAITING_CONFIRMATION)
-                    onRequestStartStt()
-                }
             }
         }
+    }
+
+    /**
+     * [RESOLVING_PRODUCT_FOR_CONFIRM]에서 HomeFragment가 클래스 해석 후 호출.
+     * 확인 멘트에는 사용자 발화가 아닌 표시명(예: 코카콜라)을 사용한다.
+     */
+    fun speakResolvedProductConfirmation(displayNameForUser: String) {
+        if (currentState != VoiceFlowState.RESOLVING_PRODUCT_FOR_CONFIRM) return
+        transitionTo(VoiceFlowState.CONFIRM_PRODUCT)
+        val msg = msgConfirmProduct(displayNameForUser)
+        speak(msg) {
+            transitionTo(VoiceFlowState.WAITING_CONFIRMATION)
+            onRequestStartStt()
+        }
+    }
+
+    /** 상품명을 목록에서 찾지 못한 경우: 확인 단계 취소 후 앱 시작 상태로 */
+    fun resetVoiceFlowAfterUnmappedProduct() {
+        if (currentState != VoiceFlowState.RESOLVING_PRODUCT_FOR_CONFIRM) return
+        currentProductName = ""
+        transitionTo(VoiceFlowState.APP_START)
     }
 
     private fun handleConfirmationReceived(text: String) {
@@ -189,6 +211,7 @@ class VoiceFlowController(
     /** 재입력 버튼 클릭 */
     fun onReinputClicked() {
         when (currentState) {
+            VoiceFlowState.RESOLVING_PRODUCT_FOR_CONFIRM,
             VoiceFlowState.CONFIRM_PRODUCT,
             VoiceFlowState.WAITING_CONFIRMATION -> {
                 currentProductName = ""
@@ -382,6 +405,7 @@ class VoiceFlowController(
             VoiceFlowState.WAITING_PRODUCT_NAME,
             VoiceFlowState.CONFIRM_PRODUCT -> true
             VoiceFlowState.APP_START,
+            VoiceFlowState.RESOLVING_PRODUCT_FOR_CONFIRM,
             VoiceFlowState.WAITING_CONFIRMATION,
             VoiceFlowState.SEARCHING_PRODUCT,
             VoiceFlowState.SEARCH_RESULT,
@@ -390,6 +414,7 @@ class VoiceFlowController(
         val stateLabel = when (state) {
             VoiceFlowState.APP_START -> "앱 시작"
             VoiceFlowState.WAITING_PRODUCT_NAME -> "상품명 입력 대기"
+            VoiceFlowState.RESOLVING_PRODUCT_FOR_CONFIRM -> "상품명 해석 중"
             VoiceFlowState.CONFIRM_PRODUCT -> "상품 확인"
             VoiceFlowState.WAITING_CONFIRMATION -> "확인 대기"
             VoiceFlowState.SEARCHING_PRODUCT -> "탐색 중"

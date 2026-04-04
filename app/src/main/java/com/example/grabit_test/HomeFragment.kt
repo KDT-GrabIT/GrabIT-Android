@@ -586,7 +586,7 @@ class HomeFragment : Fragment() {
                         onStateChanged = { _, _ -> requireActivity().runOnUiThread { updateVoiceFlowButtons() } },
                         onRequestStartStt = { requireActivity().runOnUiThread { sttManager?.startListening() } },
                         onStartSearch = { productName -> requireActivity().runOnUiThread { onStartSearchFromVoiceFlow(productName) } },
-                        onProductNameEntered = { productName -> requireActivity().runOnUiThread { setTargetFromSpokenProductName(productName) } }
+                        onProductNameEntered = { spoken -> resolveSpokenProductThenConfirmVoice(spoken) }
                     )
                     voiceFlowController?.start()
                     tryStartDetectionWithPendingTarget()
@@ -831,11 +831,28 @@ class HomeFragment : Fragment() {
         return ""
     }
 
-    private fun setTargetFromSpokenProductName(productName: String) {
+    /**
+     * 음성으로 받은 상품명을 클래스로 해석한 뒤, 사전/동의어의 표시명으로 확인 TTS를 재생한다.
+     */
+    private fun resolveSpokenProductThenConfirmVoice(spoken: String) {
         viewLifecycleOwner.lifecycleScope.launch {
-            val targetClass = mapSpokenToClass(productName)
-            if (productName.isNotBlank() && targetClass.isBlank()) return@launch
-            currentTargetLabel.set(targetClass)
+            val trimmed = spoken.trim()
+            val targetClass = mapSpokenToClass(trimmed)
+            withContext(Dispatchers.Main.immediate) {
+                if (!isAdded) return@withContext
+                val vfc = voiceFlowController ?: return@withContext
+                if (vfc.currentState != VoiceFlowController.VoiceFlowState.RESOLVING_PRODUCT_FOR_CONFIRM) return@withContext
+                if (trimmed.isNotBlank() && targetClass.isBlank()) {
+                    vfc.resetVoiceFlowAfterUnmappedProduct()
+                    val failReason = "인식된 말을 상품 목록에서 찾지 못했어요. '$trimmed'"
+                    speak(failReason) { speak(VoicePrompts.PROMPT_PRODUCT_RECOGNITION_FAILED) { } }
+                    return@withContext
+                }
+                currentTargetLabel.set(targetClass)
+                val displayName = SynonymRepository.getDisplayName(targetClass)
+                    ?: if (ProductDictionary.isLoaded()) ProductDictionary.getDisplayNameKo(targetClass) else targetClass
+                vfc.speakResolvedProductConfirmation(displayName)
+            }
         }
     }
 
