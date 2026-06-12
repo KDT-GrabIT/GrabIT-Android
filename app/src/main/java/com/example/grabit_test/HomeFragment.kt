@@ -9,9 +9,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.os.VibratorManager
 import android.util.Log
 import android.util.Size
 import android.view.KeyEvent
@@ -167,6 +164,7 @@ class HomeFragment : Fragment() {
     private var ttsManager: TTSManager? = null
     private var ttsGuidanceQueue: TtsPriorityQueue? = null
     private var beepPlayer: BeepPlayer? = null
+    private lateinit var hapticFeedbackController: HapticFeedbackController
     private var proximityModeActive = false
     private var voiceFlowController: VoiceFlowController? = null
     private val searchTimeoutHandler = Handler(Looper.getMainLooper())
@@ -186,10 +184,6 @@ class HomeFragment : Fragment() {
     private val POSITION_ANNOUNCE_MOVEMENT_THRESHOLD_NORM = 0.03f
     /** 시나리오3·4: 진동은 중앙 진입 1회, 팔길이 도달 1회만. 이 간격 미만이면 진동 생략 */
     private val VIBRATE_COOLDOWN_MS = 6000L
-
-    /** Target Lock 성공 시 사용할 최대 진동 세기 */
-    private val STRONG_VIBRATION_AMPLITUDE = 255
-
     private var lastVibrateTimeMs = 0L
     /** 직전 프레임에 정면(중앙) 구역이었는지. 진동+멘트 ①가운데 맞음 ②55cm 진입 둘만 쓰기 위해 */
     private var wasInCenterZone = false
@@ -300,6 +294,7 @@ class HomeFragment : Fragment() {
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
+        hapticFeedbackController = HapticFeedbackController(requireContext())
         loadClassLabels()
         ProductDictionary.load(requireContext())
         loadSynonymFromRemote()
@@ -501,7 +496,6 @@ class HomeFragment : Fragment() {
         }
     }
 
-
     /** 완전 무결점 초기화(Kill-All Reset). 탭 전환·TOUCH_CONFIRM 긍정 종료 시 호출. */
     private fun resetGlobalState() {
         pendingSearchTarget = null
@@ -522,10 +516,8 @@ class HomeFragment : Fragment() {
         scanHandler.removeCallbacksAndMessages(null)
         voiceSearchTargetLabel = null
         ttsDetectedPlayed = false
-
         hasPlayedTargetLockFeedbackThisSearchSession = false
         isTargetLockFeedbackPlaying = false
-
         ttsGrabPlayed = false
         ttsGrabbedPlayed = false
         ttsAskAnotherPlayed = false
@@ -946,45 +938,6 @@ class HomeFragment : Fragment() {
         }
     }
 
-    /** 탐지/접촉 확인 시 약 300ms 진동 (Vibrator API) */
-    private fun vibrateFeedback(durationMs: Long = 300L) {
-        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            (requireContext().getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
-        } else {
-            @Suppress("DEPRECATION")
-            requireContext().getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            vibrator?.vibrate(VibrationEffect.createOneShot(durationMs, VibrationEffect.DEFAULT_AMPLITUDE))
-        } else {
-            @Suppress("DEPRECATION")
-            vibrator?.vibrate(durationMs)
-        }
-    }
-
-    /** 강한 진동이 필요한 순간에 300ms 최대 진동으로 한 번만 진동. (탐지 성공 시, 터치 확인 질문 시) */
-    private fun vibrateStrongOnce() {
-        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            (requireContext().getSystemService(Context.VIBRATOR_MANAGER_SERVICE)
-                as? VibratorManager)?.defaultVibrator
-        } else {
-            @Suppress("DEPRECATION")
-            requireContext().getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            vibrator?.vibrate(
-                VibrationEffect.createOneShot(
-                    300L,
-                    STRONG_VIBRATION_AMPLITUDE
-                )
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            vibrator?.vibrate(300L)
-        }
-    }
-
     private fun enterTouchConfirm() {
         if (touchConfirmInProgress) return
         touchConfirmInProgress = true
@@ -992,7 +945,7 @@ class HomeFragment : Fragment() {
         waitingForTouchConfirm = true
         touchConfirmAskedTime = System.currentTimeMillis()
         touchConfirmSttRetryCount = 0
-        vibrateFeedback()
+        hapticFeedbackController.playDefault()
         requireActivity().runOnUiThread { updateVoiceFlowButtons() }
         speak("상품에 닿았나요? 닿았으면 예라고 말해주세요.", urgent = true, isAutoGuidance = false) {
             requireActivity().runOnUiThread { sttManager?.startListening() }
@@ -1082,7 +1035,6 @@ class HomeFragment : Fragment() {
     /** LOCKED 시 매 프레임: 방향·거리 변수 갱신, 화면 표시, 구역이 ZONE_STABLE_MS 동안 안정되면 안내. */
     private fun updatePositionStateAndAnnounceIfStable() {
         if (isTargetLockFeedbackPlaying) return
-
         val box = frozenBox ?: return
         val w = frozenImageWidth
         val h = frozenImageHeight
@@ -1270,7 +1222,7 @@ class HomeFragment : Fragment() {
                         val centerMsg = voiceFlowController?.getCenterDistanceMessage(distMm)
                             ?: "상품이 정면에 있습니다. 방향을 유지한 채 앞으로 걸어가세요."
                         speak(centerMsg, urgent = true)
-                        vibrateFeedback(400L)
+                        hapticFeedbackController.playDefault(400L)
                         lastVibrateTimeMs = now
                         if (distanceMm <= REACH_DISTANCE_MM) reachAnnouncedThisSession = true
                         lastAnnouncedZone = "정면"
@@ -1409,17 +1361,12 @@ class HomeFragment : Fragment() {
             searchState = SearchState.LOCKED
             lockedTargetLabel = box.label
             val shouldPlayLockFeedback = !hasPlayedTargetLockFeedbackThisSearchSession
-
             if (shouldPlayLockFeedback) {
                 hasPlayedTargetLockFeedbackThisSearchSession = true
-
                 proximityModeActive = false
                 beepPlayer?.stopProximityBeep()
-
-                vibrateStrongOnce()
-
+                hapticFeedbackController.playTargetLock()
                 isTargetLockFeedbackPlaying = true
-
                 speak(
                     "찾았습니다. 멈춰주세요.",
                     urgent = true,
