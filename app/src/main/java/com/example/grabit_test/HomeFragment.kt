@@ -186,6 +186,10 @@ class HomeFragment : Fragment() {
     private val POSITION_ANNOUNCE_MOVEMENT_THRESHOLD_NORM = 0.03f
     /** 시나리오3·4: 진동은 중앙 진입 1회, 팔길이 도달 1회만. 이 간격 미만이면 진동 생략 */
     private val VIBRATE_COOLDOWN_MS = 6000L
+
+    /** Target Lock 성공 시 사용할 최대 진동 세기 */
+    private val STRONG_VIBRATION_AMPLITUDE = 255
+
     private var lastVibrateTimeMs = 0L
     /** 직전 프레임에 정면(중앙) 구역이었는지. 진동+멘트 ①가운데 맞음 ②55cm 진입 둘만 쓰기 위해 */
     private var wasInCenterZone = false
@@ -229,6 +233,10 @@ class HomeFragment : Fragment() {
     private val REQUEST_CODE_PERMISSIONS = 10
 
     private var ttsDetectedPlayed = false
+    /** 이번 세션에서 "찾았습니다" 피드백 재생 여부 (락 해제 후 다시 탐색할 때 중복 방지) */
+    private var hasPlayedTargetLockFeedbackThisSearchSession = false
+    /** “찾았습니다. 멈춰주세요” 재생 중에는 위치 안내를 막는다. */
+    @Volatile private var isTargetLockFeedbackPlaying = false
     private var ttsGrabPlayed = false
     private var ttsGrabbedPlayed = false
     private var ttsAskAnotherPlayed = false
@@ -514,6 +522,10 @@ class HomeFragment : Fragment() {
         scanHandler.removeCallbacksAndMessages(null)
         voiceSearchTargetLabel = null
         ttsDetectedPlayed = false
+
+        hasPlayedTargetLockFeedbackThisSearchSession = false
+        isTargetLockFeedbackPlaying = false
+
         ttsGrabPlayed = false
         ttsGrabbedPlayed = false
         ttsAskAnotherPlayed = false
@@ -950,6 +962,29 @@ class HomeFragment : Fragment() {
         }
     }
 
+    /** 강한 진동이 필요한 순간에 300ms 최대 진동으로 한 번만 진동. (탐지 성공 시, 터치 확인 질문 시) */
+    private fun vibrateStrongOnce() {
+        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            (requireContext().getSystemService(Context.VIBRATOR_MANAGER_SERVICE)
+                as? VibratorManager)?.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            requireContext().getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            vibrator?.vibrate(
+                VibrationEffect.createOneShot(
+                    300L,
+                    STRONG_VIBRATION_AMPLITUDE
+                )
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            vibrator?.vibrate(300L)
+        }
+    }
+
     private fun enterTouchConfirm() {
         if (touchConfirmInProgress) return
         touchConfirmInProgress = true
@@ -1046,6 +1081,8 @@ class HomeFragment : Fragment() {
 
     /** LOCKED 시 매 프레임: 방향·거리 변수 갱신, 화면 표시, 구역이 ZONE_STABLE_MS 동안 안정되면 안내. */
     private fun updatePositionStateAndAnnounceIfStable() {
+        if (isTargetLockFeedbackPlaying) return
+
         val box = frozenBox ?: return
         val w = frozenImageWidth
         val h = frozenImageHeight
@@ -1177,6 +1214,7 @@ class HomeFragment : Fragment() {
 
     /** 1순위: 방향(9구역) → 2순위: 5초 모드 락 → 3순위: 거리(55cm 손 뻗기). */
     private fun processDistanceGuidance(box: OverlayView.DetectionBox, imageWidth: Int, imageHeight: Int) {
+        if (isTargetLockFeedbackPlaying) return
         if (waitingForTouchConfirm || touchConfirmInProgress) return
         val totalArea = imageWidth * imageHeight
         if (totalArea <= 0 || imageWidth <= 0) return
@@ -1370,6 +1408,26 @@ class HomeFragment : Fragment() {
             if (fromTiling) tilingGridWhenLocked = tilingGridUsed
             searchState = SearchState.LOCKED
             lockedTargetLabel = box.label
+            val shouldPlayLockFeedback = !hasPlayedTargetLockFeedbackThisSearchSession
+
+            if (shouldPlayLockFeedback) {
+                hasPlayedTargetLockFeedbackThisSearchSession = true
+
+                proximityModeActive = false
+                beepPlayer?.stopProximityBeep()
+
+                vibrateStrongOnce()
+
+                isTargetLockFeedbackPlaying = true
+
+                speak(
+                    "찾았습니다. 멈춰주세요.",
+                    urgent = true,
+                    isAutoGuidance = false
+                ) { // 중괄호는 lambda로, TTS가 끝난 후 실행할 코드 블록을 나타냄
+                    isTargetLockFeedbackPlaying = false
+                }
+            }
             validationFailCount = 0
             lastSuccessfulValidationTimeMs = System.currentTimeMillis() // 락 진입 시점을 성공 시각으로 두어 시간 기반 해제가 즉시 걸리지 않도록 함
             frozenImageWidth = imageWidth
@@ -1419,8 +1477,12 @@ class HomeFragment : Fragment() {
                 val zone = voiceFlowController?.getZoneName(box.rect, imageWidth, imageHeight)
                 val displayNameForPos = if (ProductDictionary.isLoaded()) ProductDictionary.getDisplayNameKo(lockedTargetLabel) else lockedTargetLabel
                 val positionMsg = voiceFlowController?.getPositionAnnounceMessage(displayNameForPos, box.rect, imageWidth, imageHeight, distMm)
-                if (!positionMsg.isNullOrBlank()) {
-                    speak(positionMsg)
+                if (!positionMsg.isNullOrBlank() && !shouldPlayLockFeedback) {
+                    speak(
+                        positionMsg,
+                        urgent = true,
+                        isAutoGuidance = false
+                    )
                     announcedZone = zone
                     announcedInReach = if (zone == "정면") distMm <= REACH_DISTANCE_MM else null
                 }
@@ -1456,6 +1518,7 @@ class HomeFragment : Fragment() {
             searchObjectNotFoundAnnounced = false
             if (isNewSearchSession) {
                 hasAnnouncedDetectedThisSearchSession = false
+                hasPlayedTargetLockFeedbackThisSearchSession = false
                 lastFoundAnnounceLabel = null
             }
             stopPositionAnnounce()
