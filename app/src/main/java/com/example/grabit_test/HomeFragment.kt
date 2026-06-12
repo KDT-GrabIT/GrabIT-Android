@@ -1222,7 +1222,7 @@ class HomeFragment : Fragment() {
                         val centerMsg = voiceFlowController?.getCenterDistanceMessage(distMm)
                             ?: "상품이 정면에 있습니다. 방향을 유지한 채 앞으로 걸어가세요."
                         speak(centerMsg, urgent = true)
-                        hapticFeedbackController.playDefault(400L)
+                        hapticFeedbackController.playCenterEntered()
                         lastVibrateTimeMs = now
                         if (distanceMm <= REACH_DISTANCE_MM) reachAnnouncedThisSession = true
                         lastAnnouncedZone = "정면"
@@ -1242,7 +1242,7 @@ class HomeFragment : Fragment() {
                                     lastAnnouncedZone = "정면"
                                     lastAnnouncedInReach = true
                                     if (now - lastVibrateTimeMs >= VIBRATE_COOLDOWN_MS) {
-                                        vibrateFeedback(400L)
+                                        hapticFeedbackController.playDefault(400L)
                                         lastVibrateTimeMs = now
                                     }
                                 }
