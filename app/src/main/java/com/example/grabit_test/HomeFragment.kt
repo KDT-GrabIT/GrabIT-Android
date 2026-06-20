@@ -163,7 +163,7 @@ class HomeFragment : Fragment() {
     private var sttManager: STTManager? = null
     private var ttsManager: TTSManager? = null
     private var ttsGuidanceQueue: TtsPriorityQueue? = null
-    private var beepPlayer: BeepPlayer? = null
+    private lateinit var beepFeedbackController: BeepFeedbackController
     private lateinit var hapticFeedbackController: HapticFeedbackController
     private var proximityModeActive = false
     private var voiceFlowController: VoiceFlowController? = null
@@ -388,7 +388,7 @@ class HomeFragment : Fragment() {
         gyroManager.stopTracking()
         sttManager?.release()
         ttsManager?.release()
-        beepPlayer?.release()
+        beepFeedbackController.release()
         handLandmarker?.close()
         _binding = null
     }
@@ -488,7 +488,6 @@ class HomeFragment : Fragment() {
         if (!viewLifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return
         if (isAutoGuidance && (voiceFlowController?.isInSttBreathingRoom() == true)) return
         if (!urgent && (waitingForTouchConfirm || touchConfirmInProgress || (sttManager?.isListening() == true))) return
-        beepPlayer?.stopProximityBeep()
         if (urgent) {
             ttsManager?.speak(text, android.speech.tts.TextToSpeech.QUEUE_FLUSH, onDone)
         } else {
@@ -504,7 +503,6 @@ class HomeFragment : Fragment() {
         searchState = SearchState.IDLE
         currentTargetLabel.set("")
         proximityModeActive = false
-        beepPlayer?.stopProximityBeep()
         ttsGuidanceQueue?.clear()
         ttsManager?.stop()
         sttManager?.cancelListening()
@@ -579,11 +577,12 @@ class HomeFragment : Fragment() {
                 }
             }
         )
-        beepPlayer = BeepPlayer().also { it.init() }
+        beepFeedbackController = BeepFeedbackController()
+        beepFeedbackController.init()
 
         ttsManager?.init { success ->
             requireActivity().runOnUiThread {
-                if (success && beepPlayer != null) {
+                if (success) {
                     ttsGuidanceQueue = ttsManager?.let { TtsPriorityQueue(it) }
                     voiceFlowController = VoiceFlowController(
                         ttsManager = ttsManager!!,
@@ -740,8 +739,8 @@ class HomeFragment : Fragment() {
                     }
                 }
             },
-            onListeningEndedReason = { },
-            beepPlayer = beepPlayer
+            playStartBeep = beepFeedbackController::playListeningStart,
+            onListeningEndedReason = { }
         ).also { it.init() }
     }
 
@@ -1364,7 +1363,6 @@ class HomeFragment : Fragment() {
             if (shouldPlayLockFeedback) {
                 hasPlayedTargetLockFeedbackThisSearchSession = true
                 proximityModeActive = false
-                beepPlayer?.stopProximityBeep()
                 hapticFeedbackController.playTargetLock()
                 isTargetLockFeedbackPlaying = true
                 speak(
