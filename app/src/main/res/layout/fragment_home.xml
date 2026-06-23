@@ -2,19 +2,16 @@
 <LinearLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
-    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
     android:background="?android:windowBackground">
 
-    <!-- 카메라 + 시작하기 오버레이 -->
     <FrameLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1">
 
-        <!-- 카메라 + 오버레이 -->
         <FrameLayout
             android:id="@+id/cameraContainer"
             android:layout_width="match_parent"
@@ -29,10 +26,8 @@
                 android:id="@+id/overlayView"
                 android:layout_width="match_parent"
                 android:layout_height="match_parent" />
-
         </FrameLayout>
 
-        <!-- 앱 시작 시 정중앙 시작하기 버튼 (탭 시 숨김) -->
         <FrameLayout
             android:id="@+id/startOverlay"
             android:layout_width="match_parent"
@@ -46,7 +41,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_gravity="center"
-                android:text="시작하기"
+                android:text="&#49884;&#51089;&#54616;&#44592;"
                 android:textSize="22sp"
                 android:minWidth="200dp"
                 android:minHeight="64dp"
@@ -59,7 +54,6 @@
         </FrameLayout>
     </FrameLayout>
 
-    <!-- 음성 플로우 버튼 (확인/재입력/다시 찾기) - 시작하기 버튼과 동일한 크기감 -->
     <LinearLayout
         android:id="@+id/voiceFlowButtons"
         android:layout_width="match_parent"
@@ -76,7 +70,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginEnd="8dp"
-            android:text="확인"
+            android:text="&#54869;&#51064;"
             android:textSize="18sp"
             android:minWidth="120dp"
             android:minHeight="56dp"
@@ -93,7 +87,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginEnd="8dp"
-            android:text="재입력"
+            android:text="&#51116;&#51077;&#47141;"
             android:textSize="18sp"
             android:minWidth="120dp"
             android:minHeight="56dp"
@@ -109,7 +103,7 @@
             android:id="@+id/retryBtn"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="다시 찾기"
+            android:text="&#45796;&#49884; &#52286;&#44592;"
             android:textSize="18sp"
             android:minWidth="120dp"
             android:minHeight="56dp"

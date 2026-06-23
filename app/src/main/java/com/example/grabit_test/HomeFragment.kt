@@ -167,6 +167,8 @@ class HomeFragment : Fragment() {
     private var ttsManager: TTSManager? = null
     private var ttsGuidanceQueue: TtsPriorityQueue? = null
     private var beepPlayer: BeepPlayer? = null
+    private var speakerVerificationManager: SpeakerVerificationManager? = null
+    private var isSpeakerGateInProgress = false
     private var proximityModeActive = false
     private var voiceFlowController: VoiceFlowController? = null
     private val searchTimeoutHandler = Handler(Looper.getMainLooper())
@@ -386,6 +388,8 @@ class HomeFragment : Fragment() {
         sttManager?.release()
         ttsManager?.release()
         beepPlayer?.release()
+        speakerVerificationManager?.close()
+        speakerVerificationManager = null
         handLandmarker?.close()
         _binding = null
     }
@@ -428,9 +432,90 @@ class HomeFragment : Fragment() {
         ttsManager?.stop()
         sttManager?.cancelListening()
         if (inTouchConfirm) {
-            sttManager?.startListening()
+            startSpeakerVerifiedStt("product_search_touch_confirm_volume_skip")
         } else {
             voiceFlowController?.requestSttOnly()
+        }
+    }
+
+    private fun startSpeakerVerifiedStt(reason: String) {
+        if (isSpeakerGateInProgress) {
+            Log.i(
+                SpeakerVerificationConfig.LOG_TAG,
+                "SV_STT_GATE_REQUEST ignored=true reason=$reason gate_in_progress=true"
+            )
+            return
+        }
+        val verifier = speakerVerificationManager
+        val registered = verifier?.hasVoiceprint() == true
+        Log.i(
+            SpeakerVerificationConfig.LOG_TAG,
+            "SV_STT_GATE_REQUEST reason=$reason registered=$registered"
+        )
+        if (verifier == null || !verifier.hasVoiceprint()) {
+            Log.i(
+                SpeakerVerificationConfig.LOG_TAG,
+                "SV_STT_GATE registered=false action=fallback_stt reason=$reason"
+            )
+            sttManager?.startListening()
+            return
+        }
+        isSpeakerGateInProgress = true
+        setSttGateUiEnabled(false)
+        viewLifecycleOwner.lifecycleScope.launch {
+            try {
+                val result = verifier.verifyFromMicrophone(SpeakerVerificationConfig.DEFAULT_THRESHOLD)
+                if (result.accepted) {
+                    Log.i(
+                        SpeakerVerificationConfig.LOG_TAG,
+                        "SV_STT_GATE accepted=true action=startSpeechRecognizer reason=$reason"
+                    )
+                    val rootView = view
+                    if (rootView == null) {
+                        isSpeakerGateInProgress = false
+                        setSttGateUiEnabled(true)
+                        return@launch
+                    }
+                    rootView.postDelayed({
+                        isSpeakerGateInProgress = false
+                        setSttGateUiEnabled(true)
+                        sttManager?.startListening()
+                    }, MIC_RELEASE_TO_STT_DELAY_MS)
+                } else {
+                    Log.i(
+                        SpeakerVerificationConfig.LOG_TAG,
+                        "SV_STT_GATE accepted=false action=blocked reason=$reason"
+                    )
+                    Toast.makeText(requireContext(), "\uB4F1\uB85D\uB41C \uC0AC\uC6A9\uC790 \uC74C\uC131\uC774 \uC544\uB2D9\uB2C8\uB2E4.", Toast.LENGTH_SHORT).show()
+                    voiceFlowController?.notifySttEnded()
+                    isSpeakerGateInProgress = false
+                    setSttGateUiEnabled(true)
+                }
+            } catch (e: Exception) {
+                Log.e(SpeakerVerificationConfig.LOG_TAG, "SV_STT_GATE_FAILED", e)
+                Toast.makeText(requireContext(), "\uD654\uC790 \uAC80\uC99D\uC744 \uC2E4\uD589\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4.", Toast.LENGTH_SHORT).show()
+                voiceFlowController?.notifySttEnded()
+                isSpeakerGateInProgress = false
+                setSttGateUiEnabled(true)
+            }
+        }
+    }
+
+    private fun setSttGateUiEnabled(enabled: Boolean) {
+        if (_binding == null) return
+        binding.startButton.isEnabled = enabled
+        binding.confirmBtn.isEnabled = enabled
+        binding.reinputBtn.isEnabled = enabled
+        binding.retryBtn.isEnabled = enabled
+    }
+
+    private fun currentSttGateReason(): String {
+        if (waitingForTouchConfirm || touchConfirmInProgress) return "product_search_touch_confirm"
+        return when (voiceFlowController?.currentState) {
+            VoiceFlowController.VoiceFlowState.WAITING_PRODUCT_NAME -> "product_search_product_name"
+            VoiceFlowController.VoiceFlowState.WAITING_CONFIRMATION -> "product_search_command"
+            VoiceFlowController.VoiceFlowState.CONFIRM_PRODUCT -> "product_search_command"
+            else -> "voice_command"
         }
     }
 
@@ -506,6 +591,8 @@ class HomeFragment : Fragment() {
         ttsGuidanceQueue?.clear()
         ttsManager?.stop()
         sttManager?.cancelListening()
+        isSpeakerGateInProgress = false
+        setSttGateUiEnabled(true)
         isScanning = false
         cancelSearchTimeout()
         stopPositionAnnounce()
@@ -576,6 +663,7 @@ class HomeFragment : Fragment() {
             }
         )
         beepPlayer = BeepPlayer().also { it.init() }
+        speakerVerificationManager = SpeakerVerificationManager(requireContext())
 
         ttsManager?.init { success ->
             requireActivity().runOnUiThread {
@@ -584,7 +672,7 @@ class HomeFragment : Fragment() {
                     voiceFlowController = VoiceFlowController(
                         ttsManager = ttsManager!!,
                         onStateChanged = { _, _ -> requireActivity().runOnUiThread { updateVoiceFlowButtons() } },
-                        onRequestStartStt = { requireActivity().runOnUiThread { sttManager?.startListening() } },
+                        onRequestStartStt = { requireActivity().runOnUiThread { startSpeakerVerifiedStt(currentSttGateReason()) } },
                         onStartSearch = { productName -> requireActivity().runOnUiThread { onStartSearchFromVoiceFlow(productName) } },
                         onProductNameEntered = { spoken -> resolveSpokenProductThenConfirmVoice(spoken) }
                     )
@@ -627,7 +715,7 @@ class HomeFragment : Fragment() {
                             startPositionAnnounce()
                             Toast.makeText(requireContext(), "음성 인식 실패. 다시 시도해주세요.", Toast.LENGTH_SHORT).show()
                         } else {
-                            view?.postDelayed({ if (waitingForTouchConfirm) sttManager?.startListening() }, 400L)
+                            view?.postDelayed({ if (waitingForTouchConfirm) startSpeakerVerifiedStt("product_search_touch_confirm_retry") }, 400L)
                         }
                     } else {
                         Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show()
@@ -653,14 +741,14 @@ class HomeFragment : Fragment() {
                         }
                         if (isTouchConfirm && retryCount < 2) {
                             touchConfirmSttRetryCount++
-                            view?.postDelayed({ if (waitingForTouchConfirm) sttManager?.startListening() }, 400L)
+                            view?.postDelayed({ if (waitingForTouchConfirm) startSpeakerVerifiedStt("product_search_touch_confirm_retry") }, 400L)
                             return@runOnUiThread
                         }
                         if (isVoiceConfirm && voiceConfirmSilentRetryCount < 2) {
                             voiceConfirmSilentRetryCount++
                             view?.postDelayed({
                                 if (voiceFlowController?.currentState != VoiceFlowController.VoiceFlowState.WAITING_CONFIRMATION) return@postDelayed
-                                sttManager?.startListening()
+                                startSpeakerVerifiedStt("product_search_command_retry")
                             }, 400L)
                             return@runOnUiThread
                         }
@@ -670,7 +758,7 @@ class HomeFragment : Fragment() {
                                 requireActivity().runOnUiThread {
                                     speak("다시 말해주세요.") {
                                         requireActivity().runOnUiThread {
-                                            view?.postDelayed({ sttManager?.startListening() }, 800L)
+                                            view?.postDelayed({ startSpeakerVerifiedStt("product_search_command_retry") }, 800L)
                                         }
                                     }
                                 }
@@ -678,7 +766,7 @@ class HomeFragment : Fragment() {
                         } else {
                             if (isTouchConfirm) {
                                 if (System.currentTimeMillis() - touchConfirmAskedTime < TOUCH_CONFIRM_ANSWER_WAIT_MS) {
-                                    view?.postDelayed({ if (waitingForTouchConfirm) sttManager?.startListening() }, 400L)
+                                    view?.postDelayed({ if (waitingForTouchConfirm) startSpeakerVerifiedStt("product_search_touch_confirm_retry") }, 400L)
                                     return@runOnUiThread
                                 }
                                 touchConfirmSttRetryCount = 0
@@ -709,7 +797,7 @@ class HomeFragment : Fragment() {
                     val isVoiceFlowWaiting = state == VoiceFlowController.VoiceFlowState.WAITING_PRODUCT_NAME ||
                         state == VoiceFlowController.VoiceFlowState.WAITING_CONFIRMATION
                     if (isRetryable && isVoiceFlowWaiting) {
-                        view?.postDelayed({ sttManager?.startListening() }, 800L)
+                        view?.postDelayed({ startSpeakerVerifiedStt("product_search_command_retry") }, 800L)
                     }
                 }
             },
@@ -960,7 +1048,7 @@ class HomeFragment : Fragment() {
         vibrateFeedback()
         requireActivity().runOnUiThread { updateVoiceFlowButtons() }
         speak("상품에 닿았나요? 닿았으면 예라고 말해주세요.", urgent = true, isAutoGuidance = false) {
-            requireActivity().runOnUiThread { sttManager?.startListening() }
+            requireActivity().runOnUiThread { startSpeakerVerifiedStt("product_search_touch_confirm") }
         }
     }
 
@@ -2473,5 +2561,6 @@ class HomeFragment : Fragment() {
 
     companion object {
         private const val TAG = "GrabIT_Home"
+        private const val MIC_RELEASE_TO_STT_DELAY_MS = 150L
     }
 }
