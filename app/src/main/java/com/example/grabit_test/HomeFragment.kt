@@ -9,9 +9,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.os.VibratorManager
 import android.util.Log
 import android.util.Size
 import android.view.KeyEvent
@@ -166,7 +163,8 @@ class HomeFragment : Fragment() {
     private var sttManager: STTManager? = null
     private var ttsManager: TTSManager? = null
     private var ttsGuidanceQueue: TtsPriorityQueue? = null
-    private var beepPlayer: BeepPlayer? = null
+    private lateinit var beepFeedbackController: BeepFeedbackController
+    private lateinit var hapticFeedbackController: HapticFeedbackController
     private var speakerVerificationManager: SpeakerVerificationManager? = null
     private var isSpeakerGateInProgress = false
     private var proximityModeActive = false
@@ -231,6 +229,10 @@ class HomeFragment : Fragment() {
     private val REQUEST_CODE_PERMISSIONS = 10
 
     private var ttsDetectedPlayed = false
+    /** 이번 세션에서 "찾았습니다" 피드백 재생 여부 (락 해제 후 다시 탐색할 때 중복 방지) */
+    private var hasPlayedTargetLockFeedbackThisSearchSession = false
+    /** “찾았습니다. 멈춰주세요” 재생 중에는 위치 안내를 막는다. */
+    @Volatile private var isTargetLockFeedbackPlaying = false
     private var ttsGrabPlayed = false
     private var ttsGrabbedPlayed = false
     private var ttsAskAnotherPlayed = false
@@ -294,6 +296,7 @@ class HomeFragment : Fragment() {
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
+        hapticFeedbackController = HapticFeedbackController(requireContext())
         loadClassLabels()
         ProductDictionary.load(requireContext())
         loadSynonymFromRemote()
@@ -387,7 +390,7 @@ class HomeFragment : Fragment() {
         gyroManager.stopTracking()
         sttManager?.release()
         ttsManager?.release()
-        beepPlayer?.release()
+        beepFeedbackController.release()
         speakerVerificationManager?.close()
         speakerVerificationManager = null
         handLandmarker?.close()
@@ -570,14 +573,12 @@ class HomeFragment : Fragment() {
         if (!viewLifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return
         if (isAutoGuidance && (voiceFlowController?.isInSttBreathingRoom() == true)) return
         if (!urgent && (waitingForTouchConfirm || touchConfirmInProgress || (sttManager?.isListening() == true))) return
-        beepPlayer?.stopProximityBeep()
         if (urgent) {
             ttsManager?.speak(text, android.speech.tts.TextToSpeech.QUEUE_FLUSH, onDone)
         } else {
             ttsGuidanceQueue?.enqueue(text, TtsPriorityQueue.PRIORITY_NORMAL)
         }
     }
-
 
     /** 완전 무결점 초기화(Kill-All Reset). 탭 전환·TOUCH_CONFIRM 긍정 종료 시 호출. */
     private fun resetGlobalState() {
@@ -587,7 +588,6 @@ class HomeFragment : Fragment() {
         searchState = SearchState.IDLE
         currentTargetLabel.set("")
         proximityModeActive = false
-        beepPlayer?.stopProximityBeep()
         ttsGuidanceQueue?.clear()
         ttsManager?.stop()
         sttManager?.cancelListening()
@@ -601,6 +601,8 @@ class HomeFragment : Fragment() {
         scanHandler.removeCallbacksAndMessages(null)
         voiceSearchTargetLabel = null
         ttsDetectedPlayed = false
+        hasPlayedTargetLockFeedbackThisSearchSession = false
+        isTargetLockFeedbackPlaying = false
         ttsGrabPlayed = false
         ttsGrabbedPlayed = false
         ttsAskAnotherPlayed = false
@@ -662,12 +664,13 @@ class HomeFragment : Fragment() {
                 }
             }
         )
-        beepPlayer = BeepPlayer().also { it.init() }
+        beepFeedbackController = BeepFeedbackController()
+        beepFeedbackController.init()
         speakerVerificationManager = SpeakerVerificationManager(requireContext())
 
         ttsManager?.init { success ->
             requireActivity().runOnUiThread {
-                if (success && beepPlayer != null) {
+                if (success) {
                     ttsGuidanceQueue = ttsManager?.let { TtsPriorityQueue(it) }
                     voiceFlowController = VoiceFlowController(
                         ttsManager = ttsManager!!,
@@ -824,8 +827,8 @@ class HomeFragment : Fragment() {
                     }
                 }
             },
-            onListeningEndedReason = { },
-            beepPlayer = beepPlayer
+            playStartBeep = beepFeedbackController::playListeningStart,
+            onListeningEndedReason = { }
         ).also { it.init() }
     }
 
@@ -1022,22 +1025,6 @@ class HomeFragment : Fragment() {
         }
     }
 
-    /** 탐지/접촉 확인 시 약 300ms 진동 (Vibrator API) */
-    private fun vibrateFeedback(durationMs: Long = 300L) {
-        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            (requireContext().getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
-        } else {
-            @Suppress("DEPRECATION")
-            requireContext().getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            vibrator?.vibrate(VibrationEffect.createOneShot(durationMs, VibrationEffect.DEFAULT_AMPLITUDE))
-        } else {
-            @Suppress("DEPRECATION")
-            vibrator?.vibrate(durationMs)
-        }
-    }
-
     private fun enterTouchConfirm() {
         if (touchConfirmInProgress) return
         touchConfirmInProgress = true
@@ -1045,7 +1032,7 @@ class HomeFragment : Fragment() {
         waitingForTouchConfirm = true
         touchConfirmAskedTime = System.currentTimeMillis()
         touchConfirmSttRetryCount = 0
-        vibrateFeedback()
+        hapticFeedbackController.playDefault()
         requireActivity().runOnUiThread { updateVoiceFlowButtons() }
         speak("상품에 닿았나요? 닿았으면 예라고 말해주세요.", urgent = true, isAutoGuidance = false) {
             requireActivity().runOnUiThread { startSpeakerVerifiedStt("product_search_touch_confirm") }
@@ -1134,6 +1121,7 @@ class HomeFragment : Fragment() {
 
     /** LOCKED 시 매 프레임: 방향·거리 변수 갱신, 화면 표시, 구역이 ZONE_STABLE_MS 동안 안정되면 안내. */
     private fun updatePositionStateAndAnnounceIfStable() {
+        if (isTargetLockFeedbackPlaying) return
         val box = frozenBox ?: return
         val w = frozenImageWidth
         val h = frozenImageHeight
@@ -1265,6 +1253,7 @@ class HomeFragment : Fragment() {
 
     /** 1순위: 방향(9구역) → 2순위: 5초 모드 락 → 3순위: 거리(55cm 손 뻗기). */
     private fun processDistanceGuidance(box: OverlayView.DetectionBox, imageWidth: Int, imageHeight: Int) {
+        if (isTargetLockFeedbackPlaying) return
         if (waitingForTouchConfirm || touchConfirmInProgress) return
         val totalArea = imageWidth * imageHeight
         if (totalArea <= 0 || imageWidth <= 0) return
@@ -1320,7 +1309,7 @@ class HomeFragment : Fragment() {
                         val centerMsg = voiceFlowController?.getCenterDistanceMessage(distMm)
                             ?: "상품이 정면에 있습니다. 방향을 유지한 채 앞으로 걸어가세요."
                         speak(centerMsg, urgent = true)
-                        vibrateFeedback(400L)
+                        hapticFeedbackController.playCenterEntered()
                         lastVibrateTimeMs = now
                         if (distanceMm <= REACH_DISTANCE_MM) reachAnnouncedThisSession = true
                         lastAnnouncedZone = "정면"
@@ -1340,7 +1329,7 @@ class HomeFragment : Fragment() {
                                     lastAnnouncedZone = "정면"
                                     lastAnnouncedInReach = true
                                     if (now - lastVibrateTimeMs >= VIBRATE_COOLDOWN_MS) {
-                                        vibrateFeedback(400L)
+                                        hapticFeedbackController.playDefault(400L)
                                         lastVibrateTimeMs = now
                                     }
                                 }
@@ -1458,6 +1447,20 @@ class HomeFragment : Fragment() {
             if (fromTiling) tilingGridWhenLocked = tilingGridUsed
             searchState = SearchState.LOCKED
             lockedTargetLabel = box.label
+            val shouldPlayLockFeedback = !hasPlayedTargetLockFeedbackThisSearchSession
+            if (shouldPlayLockFeedback) {
+                hasPlayedTargetLockFeedbackThisSearchSession = true
+                proximityModeActive = false
+                hapticFeedbackController.playTargetLock()
+                isTargetLockFeedbackPlaying = true
+                speak(
+                    "찾았습니다. 멈춰주세요.",
+                    urgent = true,
+                    isAutoGuidance = false
+                ) { // 중괄호는 lambda로, TTS가 끝난 후 실행할 코드 블록을 나타냄
+                    isTargetLockFeedbackPlaying = false
+                }
+            }
             validationFailCount = 0
             lastSuccessfulValidationTimeMs = System.currentTimeMillis() // 락 진입 시점을 성공 시각으로 두어 시간 기반 해제가 즉시 걸리지 않도록 함
             frozenImageWidth = imageWidth
@@ -1507,8 +1510,12 @@ class HomeFragment : Fragment() {
                 val zone = voiceFlowController?.getZoneName(box.rect, imageWidth, imageHeight)
                 val displayNameForPos = if (ProductDictionary.isLoaded()) ProductDictionary.getDisplayNameKo(lockedTargetLabel) else lockedTargetLabel
                 val positionMsg = voiceFlowController?.getPositionAnnounceMessage(displayNameForPos, box.rect, imageWidth, imageHeight, distMm)
-                if (!positionMsg.isNullOrBlank()) {
-                    speak(positionMsg)
+                if (!positionMsg.isNullOrBlank() && !shouldPlayLockFeedback) {
+                    speak(
+                        positionMsg,
+                        urgent = true,
+                        isAutoGuidance = false
+                    )
                     announcedZone = zone
                     announcedInReach = if (zone == "정면") distMm <= REACH_DISTANCE_MM else null
                 }
@@ -1544,6 +1551,7 @@ class HomeFragment : Fragment() {
             searchObjectNotFoundAnnounced = false
             if (isNewSearchSession) {
                 hasAnnouncedDetectedThisSearchSession = false
+                hasPlayedTargetLockFeedbackThisSearchSession = false
                 lastFoundAnnounceLabel = null
             }
             stopPositionAnnounce()

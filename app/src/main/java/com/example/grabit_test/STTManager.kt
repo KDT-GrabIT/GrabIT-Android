@@ -15,7 +15,6 @@ import java.util.Locale
 
 /**
  * Android SpeechRecognizer 기반 STT(음성→텍스트) 매니저
- * beepPlayer를 주입하면 startListening() 시 삐 소리만 재생 후 음성녹음 시작.
  */
 class STTManager(
     private val context: Context,
@@ -24,7 +23,7 @@ class STTManager(
     private val onErrorWithCode: ((String, Int) -> Unit)? = null,
     private val onListeningChanged: (Boolean) -> Unit = {},
     private val onPartialResult: ((String) -> Unit)? = null,
-    private val beepPlayer: BeepPlayer? = null,
+    private val playStartBeep: ((onDone: () -> Unit) -> Unit),
     /** 음성 인식이 끝난 원인(디버깅용). onEndOfSpeech/onError/onResults 시 로그 + 이 콜백으로 전달 */
     private val onListeningEndedReason: (String) -> Unit = {}
 ) {
@@ -51,7 +50,7 @@ class STTManager(
     }
     
     /**
-     * 음성 인식 시작. beepPlayer가 있으면 삐 소리만 재생 후 음성녹음 시작.
+     * 음성 인식 시작. 삐 소리만 재생 후 음성녹음 시작.
      */
     fun startListening() {
         // 비프 재생 전부터 "듣는 중" 표시 (엔진이 실제로 켜지기 전에도 사용자 피드백)
@@ -69,11 +68,7 @@ class STTManager(
             onError("마이크 권한이 필요합니다.")
             return
         }
-        if (beepPlayer != null) {
-            beepPlayer.playBeep { doStartListening() }
-        } else {
-            doStartListening()
-        }
+        playStartBeep { doStartListening() }
     }
 
     private fun doStartListening() {
