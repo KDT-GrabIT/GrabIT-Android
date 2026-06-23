@@ -162,7 +162,7 @@ class HomeFragment : Fragment() {
 
     private var sttManager: STTManager? = null
     private var ttsManager: TTSManager? = null
-    private var ttsGuidanceQueue: TtsPriorityQueue? = null
+    private lateinit var ttsFeedbackController: TtsFeedbackController
     private lateinit var beepFeedbackController: BeepFeedbackController
     private lateinit var hapticFeedbackController: HapticFeedbackController
     private var speakerVerificationManager: SpeakerVerificationManager? = null
@@ -370,7 +370,7 @@ class HomeFragment : Fragment() {
         stopPositionAnnounce()
         try { stopCamera() } catch (_: Exception) {}
         sttManager?.stopListening()
-        ttsManager?.stop()
+        ttsFeedbackController.stop()
     }
 
     override fun onStop() {
@@ -379,7 +379,7 @@ class HomeFragment : Fragment() {
         stopPositionAnnounce()
         try { stopCamera() } catch (_: Exception) {}
         sttManager?.stopListening()
-        ttsManager?.stop()
+        ttsFeedbackController.stop()
     }
 
     override fun onDestroyView() {
@@ -389,7 +389,7 @@ class HomeFragment : Fragment() {
         gpuDelegate?.close()
         gyroManager.stopTracking()
         sttManager?.release()
-        ttsManager?.release()
+        ttsFeedbackController.release()
         beepFeedbackController.release()
         speakerVerificationManager?.close()
         speakerVerificationManager = null
@@ -414,7 +414,7 @@ class HomeFragment : Fragment() {
             Toast.makeText(requireContext(), "준비 중입니다. 잠시 후 다시 시도해주세요.", Toast.LENGTH_SHORT).show()
             return
         }
-        ttsManager?.stop()
+        ttsFeedbackController.stop()
         sttManager?.cancelListening()
         voiceFlowController?.startProductNameInput()
     }
@@ -432,7 +432,7 @@ class HomeFragment : Fragment() {
         if (!canSkipToVoice) return
         if (!inTouchConfirm && voiceFlowController == null) return
         pendingSearchTarget = null
-        ttsManager?.stop()
+        ttsFeedbackController.stop()
         sttManager?.cancelListening()
         if (inTouchConfirm) {
             startSpeakerVerifiedStt("product_search_touch_confirm_volume_skip")
@@ -529,7 +529,7 @@ class HomeFragment : Fragment() {
             return
         }
         val target = pendingSearchTarget ?: return
-        if (ttsManager?.isReady() == true) {
+        if (ttsFeedbackController.isReady() == true) {
             pendingSearchTarget = null
             startDetectionWithTarget(target)
             return
@@ -571,13 +571,7 @@ class HomeFragment : Fragment() {
      * onDone은 마지막 인자로 두어 trailing lambda 사용 가능. */
     private fun speak(text: String, urgent: Boolean = true, isAutoGuidance: Boolean = true, onDone: (() -> Unit)? = null) {
         if (!viewLifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return
-        if (isAutoGuidance && (voiceFlowController?.isInSttBreathingRoom() == true)) return
-        if (!urgent && (waitingForTouchConfirm || touchConfirmInProgress || (sttManager?.isListening() == true))) return
-        if (urgent) {
-            ttsManager?.speak(text, android.speech.tts.TextToSpeech.QUEUE_FLUSH, onDone)
-        } else {
-            ttsGuidanceQueue?.enqueue(text, TtsPriorityQueue.PRIORITY_NORMAL)
-        }
+        ttsFeedbackController.speak(text, urgent, isAutoGuidance, onDone)
     }
 
     /** 완전 무결점 초기화(Kill-All Reset). 탭 전환·TOUCH_CONFIRM 긍정 종료 시 호출. */
@@ -588,8 +582,8 @@ class HomeFragment : Fragment() {
         searchState = SearchState.IDLE
         currentTargetLabel.set("")
         proximityModeActive = false
-        ttsGuidanceQueue?.clear()
-        ttsManager?.stop()
+        ttsFeedbackController.clear()
+        ttsFeedbackController.stop()
         sttManager?.cancelListening()
         isSpeakerGateInProgress = false
         setSttGateUiEnabled(true)
@@ -664,6 +658,17 @@ class HomeFragment : Fragment() {
                 }
             }
         )
+        ttsFeedbackController = TtsFeedbackController(
+            ttsManager = ttsManager!!,
+            shouldDropAutoGuidance = {
+                voiceFlowController?.isInSttBreathingRoom() == true
+            },
+            shouldBlockQueuedGuidance = {
+                waitingForTouchConfirm ||
+                    touchConfirmInProgress ||
+                    sttManager?.isListening() == true
+            }
+        )
         beepFeedbackController = BeepFeedbackController()
         beepFeedbackController.init()
         speakerVerificationManager = SpeakerVerificationManager(requireContext())
@@ -671,7 +676,6 @@ class HomeFragment : Fragment() {
         ttsManager?.init { success ->
             requireActivity().runOnUiThread {
                 if (success) {
-                    ttsGuidanceQueue = ttsManager?.let { TtsPriorityQueue(it) }
                     voiceFlowController = VoiceFlowController(
                         ttsManager = ttsManager!!,
                         onStateChanged = { _, _ -> requireActivity().runOnUiThread { updateVoiceFlowButtons() } },
