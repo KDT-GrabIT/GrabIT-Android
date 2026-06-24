@@ -89,6 +89,7 @@ class HomeFragment : Fragment() {
     enum class SearchState { IDLE, SEARCHING, LOCKED }
     private var searchState = SearchState.IDLE
     private val guidanceStateMachine = GuidanceStateMachine()
+    private val verifyHeldItemFlow = VerifyHeldItemFlow()
     private var frozenBox: OverlayView.DetectionBox? = null
     private var frozenImageWidth = 0
     private var frozenImageHeight = 0
@@ -582,6 +583,7 @@ class HomeFragment : Fragment() {
         _binding?.startOverlay?.visibility = View.VISIBLE
         searchState = SearchState.IDLE
         guidanceStateMachine.reset()
+        verifyHeldItemFlow.reset()
         currentTargetLabel.set("")
         proximityModeActive = false
         ttsFeedbackController.clear()
@@ -968,22 +970,7 @@ class HomeFragment : Fragment() {
             t == "yes" || t == "y"
         val isExplicitNo = t.contains("아니") || t.contains("아직") || t.contains("없어") || t.contains("못 찾") || t == "no" || t == "n"
         when {
-            isYes -> {
-                requireActivity().runOnUiThread {
-                    guidanceStateMachine.complete()
-                    sttManager?.cancelListening()
-                    // 리셋 완료 전까지 touchConfirmInProgress 유지 → "예" 직후 손 감지로 enterTouchConfirm() 재호출 방지
-                    touchConfirmScheduled = false
-                    waitingForTouchConfirm = false
-                    touchActive = false
-                    touchFrameCount = 0
-                    releaseFrameCount = 0
-                    updateVoiceFlowButtons()
-                    speak(VoicePrompts.PROMPT_FOUND_AND_END, urgent = true, isAutoGuidance = false) {
-                        requireActivity().runOnUiThread { performKillAllResetFromTouch() }
-                    }
-                }
-            }
+            isYes -> startHeldItemVerification()
             isExplicitNo -> resetTouchConfirmAndRetrack()
             else -> speak(VoicePrompts.PROMPT_TOUCH_RESTART, urgent = true, isAutoGuidance = false) {
                 requireActivity().runOnUiThread {
@@ -991,6 +978,29 @@ class HomeFragment : Fragment() {
                     waitingForTouchConfirm = false
                     updateVoiceFlowButtons()
                     performKillAllResetFromTouch()
+                }
+            }
+        }
+    }
+
+    private fun startHeldItemVerification() {
+        requireActivity().runOnUiThread {
+            sttManager?.cancelListening()
+            waitingForTouchConfirm = false
+            touchConfirmScheduled = true
+            touchActive = false
+            touchFrameCount = 0
+            releaseFrameCount = 0
+            updateVoiceFlowButtons()
+            speak("상품을 집은 뒤 카메라에 비춰주세요.", urgent = true, isAutoGuidance = false) {
+                requireActivity().runOnUiThread {
+                    if (verifyHeldItemFlow.start(lockedTargetLabel)) {
+                        touchConfirmInProgress = false
+                        binding.overlayView.setFrozen(false)
+                        updateVoiceFlowButtons()
+                    } else {
+                        resetTouchConfirmAndRetrack()
+                    }
                 }
             }
         }
@@ -2248,6 +2258,51 @@ class HomeFragment : Fragment() {
                 return
             }
             var inferMs = System.currentTimeMillis() - startTime
+            if (verifyHeldItemFlow.currentState != VerifyHeldItemFlow.State.IDLE) {
+                if (verifyHeldItemFlow.currentState == VerifyHeldItemFlow.State.VERIFYING) {
+                    val detections = runYOLOXSingle(bitmap)
+                    inferMs = System.currentTimeMillis() - startTime
+                    val detected = detections.maxByOrNull {
+                        it.rect.width() * it.rect.height()
+                    }
+                    val result = verifyHeldItemFlow.onDetection(
+                        detectedLabel = detected?.label,
+                        confidence = detected?.confidence ?: 0f
+                    )
+                    displayResults(detections, inferMs, w, h)
+                    when (result) {
+                        VerifyHeldItemFlow.VerificationResult.SUCCESS -> {
+                            requireActivity().runOnUiThread {
+                                guidanceStateMachine.complete()
+                                hapticFeedbackController.playVerifySuccess()
+                                touchConfirmScheduled = false
+                                speak(VoicePrompts.PROMPT_VERIFY_SUCCESS, urgent = true, isAutoGuidance = false) {
+                                    requireActivity().runOnUiThread {
+                                        performKillAllResetFromTouch()
+                                    }
+                                }
+                            }
+                        }
+                        VerifyHeldItemFlow.VerificationResult.FAILURE -> {
+                            requireActivity().runOnUiThread {
+                                guidanceStateMachine.verificationFailed()
+                                hapticFeedbackController.playVerifyFailure()
+                                speak(VoicePrompts.PROMPT_VERIFY_FAILURE, urgent = true, isAutoGuidance = false) {
+                                    view?.postDelayed({
+                                        if (verifyHeldItemFlow.currentState == VerifyHeldItemFlow.State.FAILURE) {
+                                            guidanceStateMachine.startVerification()
+                                            verifyHeldItemFlow.start(lockedTargetLabel)
+                                        }
+                                    }, 3000L)
+                                }
+                            }
+                        }
+                        VerifyHeldItemFlow.VerificationResult.PENDING -> Unit
+                    }
+                }
+                imageProxy.close()
+                return
+            }
 
             if (searchState == SearchState.LOCKED) {
                 sendFrameToHands(bitmap, imageProxy.imageInfo.timestamp)
