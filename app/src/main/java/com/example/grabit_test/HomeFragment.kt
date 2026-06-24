@@ -1209,7 +1209,11 @@ class HomeFragment : Fragment() {
             onTrackingLost = { transitionToSearching() }
         )
         gyroManager.onDeltaYawTooHigh = {
-            requireActivity().runOnUiThread { speak("천천히 움직여주세요", false) }
+            requireActivity().runOnUiThread {
+                if (!isTargetLockFeedbackPlaying && searchState == SearchState.LOCKED) {
+                    speak("천천히 움직여주세요", false)
+                }
+            }
         }
     }
 
