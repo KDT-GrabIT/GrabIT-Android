@@ -2394,6 +2394,13 @@ class HomeFragment : Fragment() {
                                 if (nowCandidate - lastCandidateFeedbackTimeMs >= CANDIDATE_FEEDBACK_COOLDOWN_MS) {
                                     lastCandidateFeedbackTimeMs = nowCandidate
                                     hapticFeedbackController.playCandidateDetected()
+                                    requireActivity().runOnUiThread {
+                                        speak(
+                                            VoicePrompts.PROMPT_CANDIDATE_DETECTED,
+                                            urgent = false,
+                                            isAutoGuidance = false
+                                        )
+                                    }
                                 }
                                 val prev = pendingLockBox
                                 val movementNorm = if (prev != null) {

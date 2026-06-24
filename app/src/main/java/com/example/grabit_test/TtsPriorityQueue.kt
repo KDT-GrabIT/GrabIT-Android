@@ -60,6 +60,13 @@ class TtsPriorityQueue(
         }
     }
 
+    fun interrupt() {
+        synchronized(queue) {
+            queue.clear()
+            isPlaying = false
+        }
+    }
+
     fun clear() {
         synchronized(queue) {
             queue.clear()

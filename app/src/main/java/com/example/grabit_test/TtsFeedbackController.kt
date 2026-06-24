@@ -18,6 +18,7 @@ class TtsFeedbackController(
         if (isAutoGuidance && shouldDropAutoGuidance()) return
         if (!urgent && shouldBlockQueuedGuidance()) return
         if (urgent) {
+            guidanceQueue.interrupt()
             ttsManager.speak(text, TextToSpeech.QUEUE_FLUSH, onDone)
         } else {
             guidanceQueue.enqueue(text, TtsPriorityQueue.PRIORITY_NORMAL)
