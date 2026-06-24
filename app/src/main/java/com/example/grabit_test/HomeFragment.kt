@@ -129,9 +129,7 @@ class HomeFragment : Fragment() {
     private val currentTargetLabel = AtomicReference<String>("")
 
     private var lastDirectionGuidanceTime = 0L
-    private var lastActionGuidanceTime = 0L
-    private val DIRECTION_GUIDANCE_COOLDOWN_MS = 4000L   // 왼쪽/오른쪽 (4초)
-    private val ACTION_GUIDANCE_COOLDOWN_MS = 10000L    // "손을 뻗어 확인해보세요" (10초)
+    private val DIRECTION_GUIDANCE_COOLDOWN_MS = 4000L
     private val SEARCH_PING_INTERVAL_MS = 12000L  // 탐색 침묵 12초 시 핑 안내
     private var lastSearchPingTime = 0L
     /** SEARCHING에서 5초 이상 미탐지 시 "상품이 보이지 않습니다" 안내 */
@@ -625,7 +623,6 @@ class HomeFragment : Fragment() {
         validationFailCount = 0
         reachDistanceFrameCount = 0
         lastDirectionGuidanceTime = 0L
-        lastActionGuidanceTime = 0L
         lastSearchPingTime = 0L
         lastTargetBox = null
         missedFramesCount = 0
@@ -1608,7 +1605,6 @@ class HomeFragment : Fragment() {
             lastTouchMidpointPx = null
             lastTouchTtsTimeMs = 0L
             lastDirectionGuidanceTime = 0L
-            lastActionGuidanceTime = 0L
             reachDistanceFrameCount = 0
             lastTargetBox = null
             missedFramesCount = 0
