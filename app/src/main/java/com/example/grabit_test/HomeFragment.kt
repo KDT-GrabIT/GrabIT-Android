@@ -88,6 +88,7 @@ class HomeFragment : Fragment() {
 
     enum class SearchState { IDLE, SEARCHING, LOCKED }
     private var searchState = SearchState.IDLE
+    private val guidanceStateMachine = GuidanceStateMachine()
     private var frozenBox: OverlayView.DetectionBox? = null
     private var frozenImageWidth = 0
     private var frozenImageHeight = 0
@@ -580,6 +581,7 @@ class HomeFragment : Fragment() {
         pendingSearchTargetPostTime = 0L
         _binding?.startOverlay?.visibility = View.VISIBLE
         searchState = SearchState.IDLE
+        guidanceStateMachine.reset()
         currentTargetLabel.set("")
         proximityModeActive = false
         ttsFeedbackController.clear()
@@ -968,6 +970,7 @@ class HomeFragment : Fragment() {
         when {
             isYes -> {
                 requireActivity().runOnUiThread {
+                    guidanceStateMachine.complete()
                     sttManager?.cancelListening()
                     // 리셋 완료 전까지 touchConfirmInProgress 유지 → "예" 직후 손 감지로 enterTouchConfirm() 재호출 방지
                     touchConfirmScheduled = false
@@ -1010,6 +1013,7 @@ class HomeFragment : Fragment() {
     /** '손 닿았나요?'에 부정 답변 시: 쿨다운·롤백 후 4초간 TOUCH_CONFIRM 재진입 락 */
     private fun resetTouchConfirmAndRetrack() {
         requireActivity().runOnUiThread {
+            guidanceStateMachine.verificationFailed()
             sttManager?.cancelListening()
             touchConfirmInProgress = false
             touchConfirmScheduled = false
@@ -1031,6 +1035,7 @@ class HomeFragment : Fragment() {
 
     private fun enterTouchConfirm() {
         if (touchConfirmInProgress) return
+        guidanceStateMachine.startVerification()
         touchConfirmInProgress = true
         touchConfirmScheduled = false
         waitingForTouchConfirm = true
@@ -1278,6 +1283,7 @@ class HomeFragment : Fragment() {
             val centerRightBound = 2f / 3f
             val inCenterZone = centerXNorm in centerLeftBound..centerRightBound &&
                 centerYNorm in centerLeftBound..centerRightBound
+            if (!inCenterZone) guidanceStateMachine.targetLocked()
 
             when {
                 centerXNorm < centerLeftBound -> {
@@ -1308,6 +1314,7 @@ class HomeFragment : Fragment() {
                     // 진동+멘트는 두 상황만: ①가운데 맞았을 때 ②가운데 유지한 채 55cm 안으로 들어왔을 때
                     val distanceMm = distMm
                     val justEnteredCenter = !wasInCenterZone
+                    if (justEnteredCenter) guidanceStateMachine.targetCentered()
                     // ① 가운데 맞음: 진동+멘트 한 세트. 55cm 이하면 "손을 뻗어" 한 번만 쓰기 위해 플래그 설정
                     if (justEnteredCenter && now - lastVibrateTimeMs >= VIBRATE_COOLDOWN_MS) {
                         val centerMsg = voiceFlowController?.getCenterDistanceMessage(distMm)
@@ -1450,6 +1457,7 @@ class HomeFragment : Fragment() {
             useTilingWhenLocked = fromTiling
             if (fromTiling) tilingGridWhenLocked = tilingGridUsed
             searchState = SearchState.LOCKED
+            guidanceStateMachine.targetLocked()
             lockedTargetLabel = box.label
             val shouldPlayLockFeedback = !hasPlayedTargetLockFeedbackThisSearchSession
             if (shouldPlayLockFeedback) {
@@ -1560,6 +1568,7 @@ class HomeFragment : Fragment() {
             }
             stopPositionAnnounce()
             searchState = SearchState.SEARCHING
+            guidanceStateMachine.startSearching()
             lockedTargetLabel = ""
             pendingLockBox = null
             pendingLockCount = 0
@@ -2319,6 +2328,7 @@ class HomeFragment : Fragment() {
                             val (matched, actualPrimaryLabel) = matchRes
                             pendingLockMissCount = 0
                             if (matched.confidence >= TARGET_CONFIDENCE_THRESHOLD) {
+                                guidanceStateMachine.candidateDetected()
                                 val prev = pendingLockBox
                                 val sameTarget = prev != null && prev.label == matched.label &&
                                     iou(matched.rect, prev.rect) >= PENDING_LOCK_IOU_THRESHOLD
@@ -2353,6 +2363,7 @@ class HomeFragment : Fragment() {
                         } else {
                             pendingLockMissCount++
                             if (pendingLockMissCount >= PENDING_LOCK_MAX_MISS_FRAMES) {
+                                guidanceStateMachine.startSearching()
                                 pendingLockBox = null
                                 pendingLockCount = 0
                                 pendingLockMissCount = 0
