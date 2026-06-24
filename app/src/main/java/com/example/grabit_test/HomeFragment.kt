@@ -103,6 +103,8 @@ class HomeFragment : Fragment() {
     private val PENDING_LOCK_MAX_MISS_FRAMES = 12
     /** 이전 박스와 IoU가 이 값 이상이면 같은 타겟으로 인정 (타일링/노이즈로 박스가 살짝 흔들려도 유지) */
     private val PENDING_LOCK_IOU_THRESHOLD = 0.2f
+    private val CANDIDATE_FEEDBACK_COOLDOWN_MS = 5000L
+    @Volatile private var lastCandidateFeedbackTimeMs = 0L
     private val TARGET_LOCK_STABILITY_MS = 1000L
     private val TARGET_LOCK_MAX_MOVEMENT_NORM = 0.03f
     private var pendingLockBox: OverlayView.DetectionBox? = null
@@ -601,6 +603,7 @@ class HomeFragment : Fragment() {
         scanHandler.removeCallbacksAndMessages(null)
         voiceSearchTargetLabel = null
         ttsDetectedPlayed = false
+        lastCandidateFeedbackTimeMs = 0L
         hasPlayedTargetLockFeedbackThisSearchSession = false
         isTargetLockFeedbackPlaying = false
         ttsGrabPlayed = false
@@ -1579,6 +1582,7 @@ class HomeFragment : Fragment() {
             searchObjectNotFoundAnnounced = false
             if (isNewSearchSession) {
                 hasAnnouncedDetectedThisSearchSession = false
+                lastCandidateFeedbackTimeMs = 0L
                 hasPlayedTargetLockFeedbackThisSearchSession = false
                 lastFoundAnnounceLabel = null
             }
@@ -2390,6 +2394,11 @@ class HomeFragment : Fragment() {
                             pendingLockMissCount = 0
                             if (matched.confidence >= TARGET_CONFIDENCE_THRESHOLD) {
                                 guidanceStateMachine.candidateDetected()
+                                val nowCandidate = System.currentTimeMillis()
+                                if (nowCandidate - lastCandidateFeedbackTimeMs >= CANDIDATE_FEEDBACK_COOLDOWN_MS) {
+                                    lastCandidateFeedbackTimeMs = nowCandidate
+                                    hapticFeedbackController.playCandidateDetected()
+                                }
                                 val prev = pendingLockBox
                                 val movementNorm = if (prev != null) {
                                     val dx = (matched.rect.centerX() - prev.rect.centerX()) / w.coerceAtLeast(1)
