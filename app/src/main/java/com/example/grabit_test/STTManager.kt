@@ -35,6 +35,10 @@ class STTManager(
     private var isListening = false
     private var audioManager: AudioManager? = null
     private var lastPartialText: String? = null
+    private var sttRequestSeq = 0
+    private var currentRequestId = 0
+    private var currentRequestStartedAtMs = 0L
+    private var currentBeepStartedAtMs = 0L
 
     fun init(): Boolean {
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
@@ -55,6 +59,10 @@ class STTManager(
     fun startListening() {
         // 비프 재생 전부터 "듣는 중" 표시 (엔진이 실제로 켜지기 전에도 사용자 피드백)
         onListeningChanged(true)
+        currentRequestId = ++sttRequestSeq
+        currentRequestStartedAtMs = System.currentTimeMillis()
+        currentBeepStartedAtMs = 0L
+        Log.i(TAG, "STT_START_REQUEST requestId=$currentRequestId")
         val sr = speechRecognizer
         if (sr == null) {
             Log.e(TAG, "STT 시작 실패: speechRecognizer=null")
@@ -68,7 +76,13 @@ class STTManager(
             onError("마이크 권한이 필요합니다.")
             return
         }
-        playStartBeep { doStartListening() }
+        currentBeepStartedAtMs = System.currentTimeMillis()
+        Log.i(TAG, "STT_BEEP_START requestId=$currentRequestId elapsedSinceRequestMs=${currentBeepStartedAtMs - currentRequestStartedAtMs}")
+        playStartBeep {
+            val now = System.currentTimeMillis()
+            Log.i(TAG, "STT_BEEP_DONE requestId=$currentRequestId beepElapsedMs=${now - currentBeepStartedAtMs} elapsedSinceRequestMs=${now - currentRequestStartedAtMs}")
+            doStartListening()
+        }
     }
 
     private fun doStartListening() {
@@ -103,6 +117,8 @@ class STTManager(
             sr.startListening(intent)
             isListening = true
             onListeningChanged(true)
+            val now = System.currentTimeMillis()
+            Log.i(TAG, "STT_START_LISTENING requestId=$currentRequestId elapsedSinceRequestMs=${now - currentRequestStartedAtMs}")
         } catch (e: Exception) {
             Log.e(TAG, "STT 시작 예외", e)
             isListening = false
@@ -149,12 +165,17 @@ class STTManager(
     }
 
     private fun createRecognitionListener() = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {}
-        override fun onBeginningOfSpeech() {}
+        override fun onReadyForSpeech(params: Bundle?) {
+            Log.i(TAG, "STT_READY_FOR_SPEECH requestId=$currentRequestId elapsedSinceRequestMs=${System.currentTimeMillis() - currentRequestStartedAtMs}")
+        }
+        override fun onBeginningOfSpeech() {
+            Log.i(TAG, "STT_BEGINNING_OF_SPEECH requestId=$currentRequestId elapsedSinceRequestMs=${System.currentTimeMillis() - currentRequestStartedAtMs}")
+        }
         override fun onRmsChanged(rmsdB: Float) {}
         override fun onBufferReceived(buffer: ByteArray?) {}
 
         override fun onEndOfSpeech() {
+            Log.i(TAG, "STT_END_OF_SPEECH requestId=$currentRequestId elapsedSinceRequestMs=${System.currentTimeMillis() - currentRequestStartedAtMs}")
             onListeningEndedReason("onEndOfSpeech")
             isListening = false
             onListeningChanged(false)
@@ -179,6 +200,7 @@ class STTManager(
                 else -> "알 수 없는 에러 (코드: $error)"
             }
             onListeningEndedReason("onError($error)")
+            Log.w(TAG, "STT_ERROR requestId=$currentRequestId code=$error msg=$msg elapsedSinceRequestMs=${System.currentTimeMillis() - currentRequestStartedAtMs}")
             isListening = false
             onListeningChanged(false)
             onErrorWithCode?.invoke(msg, error)
@@ -199,6 +221,7 @@ class STTManager(
                 else -> null
             }
             if (!finalText.isNullOrBlank()) {
+                Log.i(TAG, "STT_RESULTS requestId=$currentRequestId text=$finalText elapsedSinceRequestMs=${System.currentTimeMillis() - currentRequestStartedAtMs}")
                 onResult(finalText)
                 lastPartialText = null
             } else {
@@ -213,6 +236,9 @@ class STTManager(
             val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
             val text = matches?.firstOrNull()?.trim() ?: ""
             if (text.isNotBlank()) lastPartialText = text
+            if (text.isNotBlank()) {
+                Log.d(TAG, "STT_PARTIAL requestId=$currentRequestId text=$text elapsedSinceRequestMs=${System.currentTimeMillis() - currentRequestStartedAtMs}")
+            }
             onPartialResult?.invoke(text)
         }
 
