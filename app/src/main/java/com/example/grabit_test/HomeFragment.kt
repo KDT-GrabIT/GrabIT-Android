@@ -88,6 +88,8 @@ class HomeFragment : Fragment() {
 
     enum class SearchState { IDLE, SEARCHING, LOCKED }
     private var searchState = SearchState.IDLE
+    private val guidanceStateMachine = GuidanceStateMachine()
+    private val verifyHeldItemFlow = VerifyHeldItemFlow()
     private var frozenBox: OverlayView.DetectionBox? = null
     private var frozenImageWidth = 0
     private var frozenImageHeight = 0
@@ -101,6 +103,10 @@ class HomeFragment : Fragment() {
     private val PENDING_LOCK_MAX_MISS_FRAMES = 12
     /** 이전 박스와 IoU가 이 값 이상이면 같은 타겟으로 인정 (타일링/노이즈로 박스가 살짝 흔들려도 유지) */
     private val PENDING_LOCK_IOU_THRESHOLD = 0.2f
+    private val CANDIDATE_FEEDBACK_COOLDOWN_MS = 5000L
+    @Volatile private var lastCandidateFeedbackTimeMs = 0L
+    private val TARGET_LOCK_STABILITY_MS = 1000L
+    private val TARGET_LOCK_MAX_MOVEMENT_NORM = 0.03f
     private var pendingLockBox: OverlayView.DetectionBox? = null
     private var pendingLockCount = 0
     private var pendingLockMissCount = 0
@@ -123,9 +129,7 @@ class HomeFragment : Fragment() {
     private val currentTargetLabel = AtomicReference<String>("")
 
     private var lastDirectionGuidanceTime = 0L
-    private var lastActionGuidanceTime = 0L
-    private val DIRECTION_GUIDANCE_COOLDOWN_MS = 4000L   // 왼쪽/오른쪽 (4초)
-    private val ACTION_GUIDANCE_COOLDOWN_MS = 10000L    // "손을 뻗어 확인해보세요" (10초)
+    private val DIRECTION_GUIDANCE_COOLDOWN_MS = 4000L
     private val SEARCH_PING_INTERVAL_MS = 12000L  // 탐색 침묵 12초 시 핑 안내
     private var lastSearchPingTime = 0L
     /** SEARCHING에서 5초 이상 미탐지 시 "상품이 보이지 않습니다" 안내 */
@@ -162,7 +166,7 @@ class HomeFragment : Fragment() {
 
     private var sttManager: STTManager? = null
     private var ttsManager: TTSManager? = null
-    private var ttsGuidanceQueue: TtsPriorityQueue? = null
+    private lateinit var ttsFeedbackController: TtsFeedbackController
     private lateinit var beepFeedbackController: BeepFeedbackController
     private lateinit var hapticFeedbackController: HapticFeedbackController
     private var speakerVerificationManager: SpeakerVerificationManager? = null
@@ -370,7 +374,7 @@ class HomeFragment : Fragment() {
         stopPositionAnnounce()
         try { stopCamera() } catch (_: Exception) {}
         sttManager?.stopListening()
-        ttsManager?.stop()
+        ttsFeedbackController.stop()
     }
 
     override fun onStop() {
@@ -379,7 +383,7 @@ class HomeFragment : Fragment() {
         stopPositionAnnounce()
         try { stopCamera() } catch (_: Exception) {}
         sttManager?.stopListening()
-        ttsManager?.stop()
+        ttsFeedbackController.stop()
     }
 
     override fun onDestroyView() {
@@ -389,7 +393,7 @@ class HomeFragment : Fragment() {
         gpuDelegate?.close()
         gyroManager.stopTracking()
         sttManager?.release()
-        ttsManager?.release()
+        ttsFeedbackController.release()
         beepFeedbackController.release()
         speakerVerificationManager?.close()
         speakerVerificationManager = null
@@ -414,7 +418,7 @@ class HomeFragment : Fragment() {
             Toast.makeText(requireContext(), "준비 중입니다. 잠시 후 다시 시도해주세요.", Toast.LENGTH_SHORT).show()
             return
         }
-        ttsManager?.stop()
+        ttsFeedbackController.stop()
         sttManager?.cancelListening()
         voiceFlowController?.startProductNameInput()
     }
@@ -432,7 +436,7 @@ class HomeFragment : Fragment() {
         if (!canSkipToVoice) return
         if (!inTouchConfirm && voiceFlowController == null) return
         pendingSearchTarget = null
-        ttsManager?.stop()
+        ttsFeedbackController.stop()
         sttManager?.cancelListening()
         if (inTouchConfirm) {
             startSpeakerVerifiedStt("product_search_touch_confirm_volume_skip")
@@ -529,7 +533,7 @@ class HomeFragment : Fragment() {
             return
         }
         val target = pendingSearchTarget ?: return
-        if (ttsManager?.isReady() == true) {
+        if (ttsFeedbackController.isReady() == true) {
             pendingSearchTarget = null
             startDetectionWithTarget(target)
             return
@@ -571,13 +575,7 @@ class HomeFragment : Fragment() {
      * onDone은 마지막 인자로 두어 trailing lambda 사용 가능. */
     private fun speak(text: String, urgent: Boolean = true, isAutoGuidance: Boolean = true, onDone: (() -> Unit)? = null) {
         if (!viewLifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return
-        if (isAutoGuidance && (voiceFlowController?.isInSttBreathingRoom() == true)) return
-        if (!urgent && (waitingForTouchConfirm || touchConfirmInProgress || (sttManager?.isListening() == true))) return
-        if (urgent) {
-            ttsManager?.speak(text, android.speech.tts.TextToSpeech.QUEUE_FLUSH, onDone)
-        } else {
-            ttsGuidanceQueue?.enqueue(text, TtsPriorityQueue.PRIORITY_NORMAL)
-        }
+        ttsFeedbackController.speak(text, urgent, isAutoGuidance, onDone)
     }
 
     /** 완전 무결점 초기화(Kill-All Reset). 탭 전환·TOUCH_CONFIRM 긍정 종료 시 호출. */
@@ -586,10 +584,12 @@ class HomeFragment : Fragment() {
         pendingSearchTargetPostTime = 0L
         _binding?.startOverlay?.visibility = View.VISIBLE
         searchState = SearchState.IDLE
+        guidanceStateMachine.reset()
+        verifyHeldItemFlow.reset()
         currentTargetLabel.set("")
         proximityModeActive = false
-        ttsGuidanceQueue?.clear()
-        ttsManager?.stop()
+        ttsFeedbackController.clear()
+        ttsFeedbackController.stop()
         sttManager?.cancelListening()
         isSpeakerGateInProgress = false
         setSttGateUiEnabled(true)
@@ -601,6 +601,7 @@ class HomeFragment : Fragment() {
         scanHandler.removeCallbacksAndMessages(null)
         voiceSearchTargetLabel = null
         ttsDetectedPlayed = false
+        lastCandidateFeedbackTimeMs = 0L
         hasPlayedTargetLockFeedbackThisSearchSession = false
         isTargetLockFeedbackPlaying = false
         ttsGrabPlayed = false
@@ -622,7 +623,6 @@ class HomeFragment : Fragment() {
         validationFailCount = 0
         reachDistanceFrameCount = 0
         lastDirectionGuidanceTime = 0L
-        lastActionGuidanceTime = 0L
         lastSearchPingTime = 0L
         lastTargetBox = null
         missedFramesCount = 0
@@ -664,6 +664,17 @@ class HomeFragment : Fragment() {
                 }
             }
         )
+        ttsFeedbackController = TtsFeedbackController(
+            ttsManager = ttsManager!!,
+            shouldDropAutoGuidance = {
+                voiceFlowController?.isInSttBreathingRoom() == true
+            },
+            shouldBlockQueuedGuidance = {
+                waitingForTouchConfirm ||
+                    touchConfirmInProgress ||
+                    sttManager?.isListening() == true
+            }
+        )
         beepFeedbackController = BeepFeedbackController()
         beepFeedbackController.init()
         speakerVerificationManager = SpeakerVerificationManager(requireContext())
@@ -671,7 +682,6 @@ class HomeFragment : Fragment() {
         ttsManager?.init { success ->
             requireActivity().runOnUiThread {
                 if (success) {
-                    ttsGuidanceQueue = ttsManager?.let { TtsPriorityQueue(it) }
                     voiceFlowController = VoiceFlowController(
                         ttsManager = ttsManager!!,
                         onStateChanged = { _, _ -> requireActivity().runOnUiThread { updateVoiceFlowButtons() } },
@@ -962,21 +972,7 @@ class HomeFragment : Fragment() {
             t == "yes" || t == "y"
         val isExplicitNo = t.contains("아니") || t.contains("아직") || t.contains("없어") || t.contains("못 찾") || t == "no" || t == "n"
         when {
-            isYes -> {
-                requireActivity().runOnUiThread {
-                    sttManager?.cancelListening()
-                    // 리셋 완료 전까지 touchConfirmInProgress 유지 → "예" 직후 손 감지로 enterTouchConfirm() 재호출 방지
-                    touchConfirmScheduled = false
-                    waitingForTouchConfirm = false
-                    touchActive = false
-                    touchFrameCount = 0
-                    releaseFrameCount = 0
-                    updateVoiceFlowButtons()
-                    speak(VoicePrompts.PROMPT_FOUND_AND_END, urgent = true, isAutoGuidance = false) {
-                        requireActivity().runOnUiThread { performKillAllResetFromTouch() }
-                    }
-                }
-            }
+            isYes -> startHeldItemVerification()
             isExplicitNo -> resetTouchConfirmAndRetrack()
             else -> speak(VoicePrompts.PROMPT_TOUCH_RESTART, urgent = true, isAutoGuidance = false) {
                 requireActivity().runOnUiThread {
@@ -984,6 +980,29 @@ class HomeFragment : Fragment() {
                     waitingForTouchConfirm = false
                     updateVoiceFlowButtons()
                     performKillAllResetFromTouch()
+                }
+            }
+        }
+    }
+
+    private fun startHeldItemVerification() {
+        requireActivity().runOnUiThread {
+            sttManager?.cancelListening()
+            waitingForTouchConfirm = false
+            touchConfirmScheduled = true
+            touchActive = false
+            touchFrameCount = 0
+            releaseFrameCount = 0
+            updateVoiceFlowButtons()
+            speak("상품을 집은 뒤 카메라에 비춰주세요.", urgent = true, isAutoGuidance = false) {
+                requireActivity().runOnUiThread {
+                    if (verifyHeldItemFlow.start(lockedTargetLabel)) {
+                        touchConfirmInProgress = false
+                        binding.overlayView.setFrozen(false)
+                        updateVoiceFlowButtons()
+                    } else {
+                        resetTouchConfirmAndRetrack()
+                    }
                 }
             }
         }
@@ -1006,6 +1025,7 @@ class HomeFragment : Fragment() {
     /** '손 닿았나요?'에 부정 답변 시: 쿨다운·롤백 후 4초간 TOUCH_CONFIRM 재진입 락 */
     private fun resetTouchConfirmAndRetrack() {
         requireActivity().runOnUiThread {
+            guidanceStateMachine.verificationFailed()
             sttManager?.cancelListening()
             touchConfirmInProgress = false
             touchConfirmScheduled = false
@@ -1027,6 +1047,7 @@ class HomeFragment : Fragment() {
 
     private fun enterTouchConfirm() {
         if (touchConfirmInProgress) return
+        guidanceStateMachine.startVerification()
         touchConfirmInProgress = true
         touchConfirmScheduled = false
         waitingForTouchConfirm = true
@@ -1188,7 +1209,11 @@ class HomeFragment : Fragment() {
             onTrackingLost = { transitionToSearching() }
         )
         gyroManager.onDeltaYawTooHigh = {
-            requireActivity().runOnUiThread { speak("천천히 움직여주세요", false) }
+            requireActivity().runOnUiThread {
+                if (!isTargetLockFeedbackPlaying && searchState == SearchState.LOCKED) {
+                    speak("천천히 움직여주세요", false)
+                }
+            }
         }
     }
 
@@ -1274,6 +1299,7 @@ class HomeFragment : Fragment() {
             val centerRightBound = 2f / 3f
             val inCenterZone = centerXNorm in centerLeftBound..centerRightBound &&
                 centerYNorm in centerLeftBound..centerRightBound
+            if (!inCenterZone) guidanceStateMachine.targetLocked()
 
             when {
                 centerXNorm < centerLeftBound -> {
@@ -1304,6 +1330,7 @@ class HomeFragment : Fragment() {
                     // 진동+멘트는 두 상황만: ①가운데 맞았을 때 ②가운데 유지한 채 55cm 안으로 들어왔을 때
                     val distanceMm = distMm
                     val justEnteredCenter = !wasInCenterZone
+                    if (justEnteredCenter) guidanceStateMachine.targetCentered()
                     // ① 가운데 맞음: 진동+멘트 한 세트. 55cm 이하면 "손을 뻗어" 한 번만 쓰기 위해 플래그 설정
                     if (justEnteredCenter && now - lastVibrateTimeMs >= VIBRATE_COOLDOWN_MS) {
                         val centerMsg = voiceFlowController?.getCenterDistanceMessage(distMm)
@@ -1446,6 +1473,7 @@ class HomeFragment : Fragment() {
             useTilingWhenLocked = fromTiling
             if (fromTiling) tilingGridWhenLocked = tilingGridUsed
             searchState = SearchState.LOCKED
+            guidanceStateMachine.targetLocked()
             lockedTargetLabel = box.label
             val shouldPlayLockFeedback = !hasPlayedTargetLockFeedbackThisSearchSession
             if (shouldPlayLockFeedback) {
@@ -1551,11 +1579,13 @@ class HomeFragment : Fragment() {
             searchObjectNotFoundAnnounced = false
             if (isNewSearchSession) {
                 hasAnnouncedDetectedThisSearchSession = false
+                lastCandidateFeedbackTimeMs = 0L
                 hasPlayedTargetLockFeedbackThisSearchSession = false
                 lastFoundAnnounceLabel = null
             }
             stopPositionAnnounce()
             searchState = SearchState.SEARCHING
+            guidanceStateMachine.startSearching()
             lockedTargetLabel = ""
             pendingLockBox = null
             pendingLockCount = 0
@@ -1575,7 +1605,6 @@ class HomeFragment : Fragment() {
             lastTouchMidpointPx = null
             lastTouchTtsTimeMs = 0L
             lastDirectionGuidanceTime = 0L
-            lastActionGuidanceTime = 0L
             reachDistanceFrameCount = 0
             lastTargetBox = null
             missedFramesCount = 0
@@ -2235,6 +2264,51 @@ class HomeFragment : Fragment() {
                 return
             }
             var inferMs = System.currentTimeMillis() - startTime
+            if (verifyHeldItemFlow.currentState != VerifyHeldItemFlow.State.IDLE) {
+                if (verifyHeldItemFlow.currentState == VerifyHeldItemFlow.State.VERIFYING) {
+                    val detections = runYOLOXSingle(bitmap)
+                    inferMs = System.currentTimeMillis() - startTime
+                    val detected = detections.maxByOrNull {
+                        it.rect.width() * it.rect.height()
+                    }
+                    val result = verifyHeldItemFlow.onDetection(
+                        detectedLabel = detected?.label,
+                        confidence = detected?.confidence ?: 0f
+                    )
+                    displayResults(detections, inferMs, w, h)
+                    when (result) {
+                        VerifyHeldItemFlow.VerificationResult.SUCCESS -> {
+                            requireActivity().runOnUiThread {
+                                guidanceStateMachine.complete()
+                                hapticFeedbackController.playVerifySuccess()
+                                touchConfirmScheduled = false
+                                speak(VoicePrompts.PROMPT_VERIFY_SUCCESS, urgent = true, isAutoGuidance = false) {
+                                    requireActivity().runOnUiThread {
+                                        performKillAllResetFromTouch()
+                                    }
+                                }
+                            }
+                        }
+                        VerifyHeldItemFlow.VerificationResult.FAILURE -> {
+                            requireActivity().runOnUiThread {
+                                guidanceStateMachine.verificationFailed()
+                                hapticFeedbackController.playVerifyFailure()
+                                speak(VoicePrompts.PROMPT_VERIFY_FAILURE, urgent = true, isAutoGuidance = false) {
+                                    view?.postDelayed({
+                                        if (verifyHeldItemFlow.currentState == VerifyHeldItemFlow.State.FAILURE) {
+                                            guidanceStateMachine.startVerification()
+                                            verifyHeldItemFlow.start(lockedTargetLabel)
+                                        }
+                                    }, 3000L)
+                                }
+                            }
+                        }
+                        VerifyHeldItemFlow.VerificationResult.PENDING -> Unit
+                    }
+                }
+                imageProxy.close()
+                return
+            }
 
             if (searchState == SearchState.LOCKED) {
                 sendFrameToHands(bitmap, imageProxy.imageInfo.timestamp)
@@ -2315,15 +2389,37 @@ class HomeFragment : Fragment() {
                             val (matched, actualPrimaryLabel) = matchRes
                             pendingLockMissCount = 0
                             if (matched.confidence >= TARGET_CONFIDENCE_THRESHOLD) {
+                                guidanceStateMachine.candidateDetected()
+                                val nowCandidate = System.currentTimeMillis()
+                                if (nowCandidate - lastCandidateFeedbackTimeMs >= CANDIDATE_FEEDBACK_COOLDOWN_MS) {
+                                    lastCandidateFeedbackTimeMs = nowCandidate
+                                    hapticFeedbackController.playCandidateDetected()
+                                    requireActivity().runOnUiThread {
+                                        speak(
+                                            VoicePrompts.PROMPT_CANDIDATE_DETECTED,
+                                            urgent = false,
+                                            isAutoGuidance = false
+                                        )
+                                    }
+                                }
                                 val prev = pendingLockBox
-                                val sameTarget = prev != null && prev.label == matched.label &&
-                                    iou(matched.rect, prev.rect) >= PENDING_LOCK_IOU_THRESHOLD
+                                val movementNorm = if (prev != null) {
+                                    val dx = (matched.rect.centerX() - prev.rect.centerX()) / w.coerceAtLeast(1)
+                                    val dy = (matched.rect.centerY() - prev.rect.centerY()) / h.coerceAtLeast(1)
+                                    sqrt(dx * dx + dy * dy)
+                                } else {
+                                    Float.MAX_VALUE
+                                }
+                                val sameTarget = prev != null &&
+                                    prev.label == matched.label &&
+                                    iou(matched.rect, prev.rect) >= PENDING_LOCK_IOU_THRESHOLD &&
+                                    movementNorm <= TARGET_LOCK_MAX_MOVEMENT_NORM
                                 if (sameTarget) {
                                     pendingLockCount++
                                     val nowLock = System.currentTimeMillis()
                                     val stableDurationMs = if (pendingLockStableSinceMs > 0L) nowLock - pendingLockStableSinceMs else 0L
                                     if (pendingLockCount >= LOCK_CONFIRM_FRAMES &&
-                                        stableDurationMs >= POSITION_ANNOUNCE_STABILITY_MS) {
+                                        stableDurationMs >= TARGET_LOCK_STABILITY_MS) {
                                         pendingLockBox = null
                                         pendingLockCount = 0
                                         pendingLockMissCount = 0
@@ -2349,6 +2445,7 @@ class HomeFragment : Fragment() {
                         } else {
                             pendingLockMissCount++
                             if (pendingLockMissCount >= PENDING_LOCK_MAX_MISS_FRAMES) {
+                                guidanceStateMachine.startSearching()
                                 pendingLockBox = null
                                 pendingLockCount = 0
                                 pendingLockMissCount = 0
