@@ -1635,6 +1635,7 @@ class HomeFragment : Fragment() {
                         .filter { it.isNotEmpty() && !it.startsWith("#") }
                 }
             }
+            Log.i(TAG, "YOLOX_LABELS_LOADED count=${classLabels.size}")
         } catch (e: Exception) {
             Log.e(TAG, "classes.txt 로드 실패", e)
             classLabels = emptyList()
@@ -1719,11 +1720,19 @@ class HomeFragment : Fragment() {
                 requireActivity().runOnUiThread { }
             }
             yoloxInterpreter = Interpreter(modelFile, options)
-            val inputShape = yoloxInterpreter?.getInputTensor(0)?.shape()?.contentToString()
-            val outputShape = yoloxInterpreter?.getOutputTensor(0)?.shape()?.contentToString()
+            val inputShape = yoloxInterpreter?.getInputTensor(0)?.shape()
+            val outputShape = yoloxInterpreter?.getOutputTensor(0)?.shape()
+            val outputDim = outputShape?.lastOrNull()
+            val expectedDim = if (classLabels.isNotEmpty()) classLabels.size + 5 else null
             Log.i(
                 TAG,
-                "YOLOX_MODEL_LOADED file=$YOLOX_MODEL_FILE input=$inputShape output=$outputShape labels=${classLabels.size}"
+                "YOLOX_MODEL_LOADED file=$YOLOX_MODEL_FILE"
+            )
+            Log.i(TAG, "YOLOX_INPUT_SHAPE ${inputShape?.contentToString()}")
+            Log.i(TAG, "YOLOX_OUTPUT_SHAPE ${outputShape?.contentToString()}")
+            Log.i(
+                TAG,
+                "YOLOX_CLASS_COUNT_CHECK labels=${classLabels.size} outputDim=$outputDim expectedDim=$expectedDim"
             )
         } catch (e: Exception) {
             Log.e(TAG, "YOLOX 초기화 실패", e)
@@ -1891,7 +1900,8 @@ class HomeFragment : Fragment() {
             maxOf(output[0][0], output[1][0], output[2][0], output[3][0]) <= 1.5f
         } else true
 
-        val hasObjectness = (boxSize == 85 || boxSize == 58 || boxSize == 55 || boxSize == 54)
+        val expectedObjectnessDim = if (classLabels.isNotEmpty()) classLabels.size + 5 else -1
+        val hasObjectness = boxSize == expectedObjectnessDim || boxSize == 85 || boxSize == 58 || boxSize == 55 || boxSize == 54
         val scoreStart = if (hasObjectness) 5 else 4
         val classCount = (boxSize - scoreStart).coerceAtLeast(1)
         if (!hasLoggedYoloxClassMismatch && classLabels.isNotEmpty() && classLabels.size != classCount) {
