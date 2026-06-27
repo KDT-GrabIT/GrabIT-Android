@@ -959,12 +959,12 @@ class HomeFragment : Fragment() {
             Log.i(TAG, "VOICE_DIAG_MAP_HIT source=proximity classLabel=$it elapsedMs=${System.currentTimeMillis() - startedAtMs}")
             return it
         }
-        SynonymRepository.findClassByNameWithFallback(spoken)?.let {
-            Log.i(TAG, "VOICE_DIAG_MAP_HIT source=nameFallback classLabel=$it elapsedMs=${System.currentTimeMillis() - startedAtMs}")
-            return it
-        }
         ProductDictionary.findClassByStt(spoken)?.let {
             Log.i(TAG, "VOICE_DIAG_MAP_HIT source=productDictionary classLabel=$it elapsedMs=${System.currentTimeMillis() - startedAtMs}")
+            return it
+        }
+        SynonymRepository.findClassByNameWithFallback(spoken)?.let {
+            Log.i(TAG, "VOICE_DIAG_MAP_HIT source=nameFallback classLabel=$it elapsedMs=${System.currentTimeMillis() - startedAtMs}")
             return it
         }
         val s = spoken.trim().lowercase().replace(" ", "")
