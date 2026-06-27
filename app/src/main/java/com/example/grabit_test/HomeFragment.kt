@@ -85,6 +85,7 @@ class HomeFragment : Fragment() {
     private val latestHandsResult = AtomicReference<HandLandmarkerResult?>(null)
 
     private var classLabels: List<String> = emptyList()
+    private var hasLoggedYoloxClassMismatch = false
 
     enum class SearchState { IDLE, SEARCHING, LOCKED }
     private var searchState = SearchState.IDLE
@@ -1704,7 +1705,7 @@ class HomeFragment : Fragment() {
 
     private fun initYOLOX() {
         try {
-            val modelFile = loadModelFile("yolox_nano_49cls_float16.tflite")
+            val modelFile = loadModelFile(YOLOX_MODEL_FILE)
             val options = Interpreter.Options()
             try {
                 gpuDelegate = GpuDelegate()
@@ -1718,6 +1719,12 @@ class HomeFragment : Fragment() {
                 requireActivity().runOnUiThread { }
             }
             yoloxInterpreter = Interpreter(modelFile, options)
+            val inputShape = yoloxInterpreter?.getInputTensor(0)?.shape()?.contentToString()
+            val outputShape = yoloxInterpreter?.getOutputTensor(0)?.shape()?.contentToString()
+            Log.i(
+                TAG,
+                "YOLOX_MODEL_LOADED file=$YOLOX_MODEL_FILE input=$inputShape output=$outputShape labels=${classLabels.size}"
+            )
         } catch (e: Exception) {
             Log.e(TAG, "YOLOX 초기화 실패", e)
             requireActivity().runOnUiThread { }
@@ -1887,6 +1894,13 @@ class HomeFragment : Fragment() {
         val hasObjectness = (boxSize == 85 || boxSize == 58 || boxSize == 55 || boxSize == 54)
         val scoreStart = if (hasObjectness) 5 else 4
         val classCount = (boxSize - scoreStart).coerceAtLeast(1)
+        if (!hasLoggedYoloxClassMismatch && classLabels.isNotEmpty() && classLabels.size != classCount) {
+            hasLoggedYoloxClassMismatch = true
+            Log.w(
+                TAG,
+                "YOLOX_CLASS_COUNT_MISMATCH outputClassCount=$classCount labelCount=${classLabels.size} boxSize=$boxSize"
+            )
+        }
         val useSingleScoreFormat = (numBoxes <= 100 && boxSize >= 5)
         val minConfidenceToShow = when {
             useSingleScoreFormat -> 0.35f
@@ -2666,6 +2680,7 @@ class HomeFragment : Fragment() {
 
     companion object {
         private const val TAG = "GrabIT_Home"
+        private const val YOLOX_MODEL_FILE = "yolox_nano_retail_640_balanced_split_fp16.tflite"
         private const val MIC_RELEASE_TO_STT_DELAY_MS = 150L
     }
 }
