@@ -175,6 +175,7 @@ class HomeFragment : Fragment() {
     private lateinit var beepFeedbackController: BeepFeedbackController
     private lateinit var hapticFeedbackController: HapticFeedbackController
     private var speakerVerificationManager: SpeakerVerificationManager? = null
+    private var voiceActivityDetector: VoiceActivityDetector? = null
     private var isSpeakerGateInProgress = false
     private var proximityModeActive = false
     private var voiceFlowController: VoiceFlowController? = null
@@ -466,53 +467,80 @@ class HomeFragment : Fragment() {
             SpeakerVerificationConfig.LOG_TAG,
             "SV_STT_GATE_REQUEST reason=$reason registered=$registered"
         )
-        if (verifier == null || !verifier.hasVoiceprint()) {
-            Log.i(
-                SpeakerVerificationConfig.LOG_TAG,
-                "SV_STT_GATE registered=false action=fallback_stt reason=$reason"
-            )
-            Log.i(TAG, "VOICE_DIAG_STT_START_DIRECT reason=$reason registered=false elapsedMs=${System.currentTimeMillis() - gateRequestAtMs}")
-            sttManager?.startListening()
-            return
-        }
         isSpeakerGateInProgress = true
         setSttGateUiEnabled(false)
-        viewLifecycleOwner.lifecycleScope.launch {
-            try {
-                val result = verifier.verifyFromMicrophone(SpeakerVerificationConfig.DEFAULT_THRESHOLD)
-                if (result.accepted) {
+
+        Log.i(TAG, "VOICE_DIAG_STT_GATE_BEEP_START reason=$reason elapsedMs=${System.currentTimeMillis() - gateRequestAtMs}")
+        beepFeedbackController.playListeningStart {
+            Log.i(TAG, "VOICE_DIAG_STT_GATE_BEEP_DONE reason=$reason elapsedMs=${System.currentTimeMillis() - gateRequestAtMs}")
+            if (verifier == null || !registered) {
+                Log.i(
+                    SpeakerVerificationConfig.LOG_TAG,
+                    "SV_STT_GATE registered=false action=fallback_stt_without_extra_beep reason=$reason"
+                )
+                isSpeakerGateInProgress = false
+                setSttGateUiEnabled(true)
+                sttManager?.startListeningWithoutBeep()
+                return@playListeningStart
+            }
+
+            val vad = voiceActivityDetector
+            if (vad == null) {
+                isSpeakerGateInProgress = false
+                setSttGateUiEnabled(true)
+                sttManager?.startListeningWithoutBeep()
+                return@playListeningStart
+            }
+
+            viewLifecycleOwner.lifecycleScope.launch {
+                try {
+                    val capture = vad.recordAndAnalyze(SpeakerVerificationConfig.RECORD_MILLIS)
+                    val vadResult = capture.result
                     Log.i(
-                        SpeakerVerificationConfig.LOG_TAG,
-                        "SV_STT_GATE accepted=true action=startSpeechRecognizer reason=$reason"
+                        TAG,
+                        "VAD_GATE reason=$reason speech=${vadResult.isSpeech} vadReason=${vadResult.reason} " +
+                            "rmsDb=${"%.1f".format(vadResult.rmsDb)} speechFrameRatio=${"%.2f".format(vadResult.speechFrameRatio)} " +
+                            "capturedSamples=${vadResult.capturedSamples} elapsedMs=${System.currentTimeMillis() - gateRequestAtMs}"
                     )
-                    val rootView = view
-                    if (rootView == null) {
+                    if (!vadResult.isSpeech) {
+                        voiceFlowController?.notifySttEnded()
                         isSpeakerGateInProgress = false
                         setSttGateUiEnabled(true)
+                        Toast.makeText(requireContext(), "\uB9D0\uC18C\uB9AC\uAC00 \uAC10\uC9C0\uB418\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4. \uB2E4\uC2DC \uC2DC\uC791\uD574\uC8FC\uC138\uC694.", Toast.LENGTH_SHORT).show()
                         return@launch
                     }
-                    rootView.postDelayed({
+
+                    val result = verifier.verifyRecordedAudio(capture.audio, SpeakerVerificationConfig.DEFAULT_THRESHOLD)
+                    if (result.accepted) {
+                        Log.i(
+                            SpeakerVerificationConfig.LOG_TAG,
+                            "SV_STT_GATE accepted=true action=startSpeechRecognizerFromRecordedAudio reason=$reason"
+                        )
                         isSpeakerGateInProgress = false
                         setSttGateUiEnabled(true)
-                        Log.i(TAG, "VOICE_DIAG_STT_GATE_ACCEPTED reason=$reason delayMs=$MIC_RELEASE_TO_STT_DELAY_MS elapsedMs=${System.currentTimeMillis() - gateRequestAtMs}")
-                        sttManager?.startListening()
-                    }, MIC_RELEASE_TO_STT_DELAY_MS)
-                } else {
-                    Log.i(
-                        SpeakerVerificationConfig.LOG_TAG,
-                        "SV_STT_GATE accepted=false action=blocked reason=$reason"
-                    )
-                    Toast.makeText(requireContext(), "\uB4F1\uB85D\uB41C \uC0AC\uC6A9\uC790 \uC74C\uC131\uC774 \uC544\uB2D9\uB2C8\uB2E4.", Toast.LENGTH_SHORT).show()
+                        Log.i(TAG, "VOICE_DIAG_STT_GATE_ACCEPTED_RECORDED reason=$reason elapsedMs=${System.currentTimeMillis() - gateRequestAtMs}")
+                        val consumed = sttManager?.startListeningFromAudio(capture.audio) == true
+                        if (!consumed) {
+                            Log.w(TAG, "VOICE_DIAG_STT_RECORDED_UNSUPPORTED_FALLBACK_LIVE reason=$reason")
+                            sttManager?.startListeningWithoutBeep()
+                        }
+                    } else {
+                        Log.i(
+                            SpeakerVerificationConfig.LOG_TAG,
+                            "SV_STT_GATE accepted=false action=blocked reason=$reason"
+                        )
+                        Toast.makeText(requireContext(), "\uB4F1\uB85D\uB41C \uC0AC\uC6A9\uC790 \uC74C\uC131\uC774 \uC544\uB2D9\uB2C8\uB2E4.", Toast.LENGTH_SHORT).show()
+                        voiceFlowController?.notifySttEnded()
+                        isSpeakerGateInProgress = false
+                        setSttGateUiEnabled(true)
+                    }
+                } catch (e: Exception) {
+                    Log.e(SpeakerVerificationConfig.LOG_TAG, "SV_STT_GATE_FAILED", e)
+                    Toast.makeText(requireContext(), "\uD654\uC790 \uAC80\uC99D\uC744 \uC2E4\uD589\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4.", Toast.LENGTH_SHORT).show()
                     voiceFlowController?.notifySttEnded()
                     isSpeakerGateInProgress = false
                     setSttGateUiEnabled(true)
                 }
-            } catch (e: Exception) {
-                Log.e(SpeakerVerificationConfig.LOG_TAG, "SV_STT_GATE_FAILED", e)
-                Toast.makeText(requireContext(), "\uD654\uC790 \uAC80\uC99D\uC744 \uC2E4\uD589\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4.", Toast.LENGTH_SHORT).show()
-                voiceFlowController?.notifySttEnded()
-                isSpeakerGateInProgress = false
-                setSttGateUiEnabled(true)
             }
         }
     }
@@ -687,6 +715,7 @@ class HomeFragment : Fragment() {
         beepFeedbackController = BeepFeedbackController()
         beepFeedbackController.init()
         speakerVerificationManager = SpeakerVerificationManager(requireContext())
+        voiceActivityDetector = VoiceActivityDetector(requireContext())
 
         ttsManager?.init { success ->
             requireActivity().runOnUiThread {
